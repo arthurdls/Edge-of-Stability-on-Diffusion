@@ -1,3 +1,3 @@
-### Edge of Stability on Diffusion Models
+# Edge of Stability on Diffusion Models
 ---
 ...
