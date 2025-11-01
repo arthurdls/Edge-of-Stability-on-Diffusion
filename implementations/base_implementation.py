@@ -1,14 +1,21 @@
-import math
-import os
 from pathlib import Path
+from torchvision import utils
+from tqdm import tqdm
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import utils
+
+print('torch:', torch.__version__)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('device ->', device)
 
 # Utilities: beta schedules and forward q_sample
 def linear_beta_schedule(timesteps, beta_start=1e-4, beta_end=0.02):
     return torch.linspace(beta_start, beta_end, timesteps)
 
 class DiffusionSchedule:
-    def __init__(self, timesteps=1000, device='cpu'):
+    def __init__(self, timesteps=50, device='cpu'):
         self.device = device
         self.timesteps = timesteps
         betas = linear_beta_schedule(timesteps).to(device)
@@ -22,6 +29,7 @@ class DiffusionSchedule:
         self.alphas_cumprod_prev = alphas_cumprod_prev
 
         self.sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+        self.sqrt_alphas_cumprod_prev = torch.sqrt(alphas_cumprod_prev)
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - alphas_cumprod)
         self.sqrt_recip_alphas = torch.sqrt(1.0 / alphas)
         self.posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
@@ -35,7 +43,7 @@ class DiffusionSchedule:
 
 # Minimal UNet-like model adapted for CIFAR-10 (3 channels)
 class TinyUNet(nn.Module):
-    def __init__(self, in_ch=3, base_ch=64, time_emb_dim=128):
+    def __init__(self, in_ch=3, base_ch=64, time_emb_dim=128, max_t=50.0):
         super().__init__()
         self.time_mlp = nn.Sequential(
             nn.Linear(time_emb_dim, time_emb_dim),
@@ -60,8 +68,10 @@ class TinyUNet(nn.Module):
         self.norm2 = nn.GroupNorm(8, base_ch*2)
         self.norm3 = nn.GroupNorm(8, base_ch*2)
 
+        self.max_t = max_t
+
     def forward(self, x, t):
-        t = t.float().unsqueeze(-1) / float(1000)
+        t = t.float().unsqueeze(-1) / float(self.max_t)
         temb = self.time_proj(t)
         h1 = self.act(self.norm1(self.conv1(x)))
         h2 = F.avg_pool2d(h1, 2)
@@ -84,35 +94,65 @@ def p_losses(model, schedule, x_start, t):
     predicted_noise = model(x_noisy, t)
     return F.mse_loss(predicted_noise, noise)
 
+
+# DDIM sampling
 @torch.no_grad()
-def p_sample(model, schedule, x, t):
-    # x: (B,C,H,W), t: int scalar
-    betas_t = schedule.betas[t]
-    sqrt_one_minus_alphas_cumprod_t = schedule.sqrt_one_minus_alphas_cumprod[t]
-    sqrt_alphas_cumprod_t = schedule.sqrt_alphas_cumprod[t]
+def p_sample(model, schedule, x, t, eta=0.0):
+    """
+    DDIM single-step update from t -> t-1.
+    eta=0.0 -> deterministic DDIM (no added noise).
+    eta>0.0 -> adds controlled noise (stochastic DDIM).
+    """
+    # scalar tensors for the required alphas
+    alpha_bar_t = schedule.alphas_cumprod[t]            # ᾱ_t
+    alpha_bar_prev = schedule.alphas_cumprod_prev[t]    # ᾱ_{t-1}
+    sqrt_alpha_bar_t = schedule.sqrt_alphas_cumprod[t]  # sqrt(ᾱ_t)
+    sqrt_alpha_bar_prev = schedule.sqrt_alphas_cumprod_prev[t]  # sqrt(ᾱ_{t-1})
+    sqrt_one_minus_alpha_bar_t = schedule.sqrt_one_minus_alphas_cumprod[t]  # sqrt(1-ᾱ_t)
+
+    # model predicts noise (ε_t)
     predicted_noise = model(x, torch.tensor([t], device=x.device).repeat(x.shape[0]))
-    x0_pred = (x - sqrt_one_minus_alphas_cumprod_t * predicted_noise) / sqrt_alphas_cumprod_t
-    x0_pred = x0_pred.clamp(-1.,1.)
-    posterior_mean = (
-        schedule.alphas[t].sqrt() * x0_pred +
-        (1 - schedule.alphas[t]).sqrt() * predicted_noise
-    )
+
+    # predict x0 (same as DDPM)
+    x0_pred = (x - sqrt_one_minus_alpha_bar_t * predicted_noise) / sqrt_alpha_bar_t
+    x0_pred = x0_pred.clamp(-1., 1.)
+
+    # epsilon from model prediction (this is ε_t in DDIM paper)
+    eps_pred = (x - sqrt_alpha_bar_t * x0_pred) / sqrt_one_minus_alpha_bar_t
+
+    # compute sigma_t (controls stochasticity). DDIM paper choice:
+    # sigma_t = eta * sqrt((1 - ᾱ_{t-1})/(1 - ᾱ_t)) * sqrt(1 - ᾱ_t/ᾱ_{t-1})
+    # if eta==0 => sigma_t == 0 (deterministic)
+    # ensure all ops on tensors for device consistency
     if t == 0:
-        return posterior_mean
-    else:
-        var = schedule.posterior_variance[t]
+        # when t==0 alpha_bar_prev == 1 so sqrt_alpha_bar_prev * x0_pred == x0_pred
+        return sqrt_alpha_bar_prev * x0_pred
+
+    frac = (1. - alpha_bar_prev) / (1. - alpha_bar_t)
+    sigma_t = eta * torch.sqrt(frac) * torch.sqrt(1. - (alpha_bar_t / alpha_bar_prev))
+
+    # compute the non stochastic component
+    # note: ensure inside sqrt is non-negative by construction for valid schedules
+    non_stochastic_coeff = torch.sqrt(torch.clamp(1. - alpha_bar_prev - sigma_t * sigma_t, min=0.0))
+
+    x_prev = sqrt_alpha_bar_prev * x0_pred + non_stochastic_coeff * eps_pred
+
+    if eta > 0.0:
         noise = torch.randn_like(x)
-        return posterior_mean + var.sqrt() * noise
+        x_prev = x_prev + sigma_t * noise
+
+    return x_prev
+
 
 @torch.no_grad()
-def sample_loop(model, schedule, shape, device):
+def sample_loop(model, schedule, shape, device, eta=0.0):
     img = torch.randn(shape, device=device)
     for t in reversed(range(schedule.timesteps)):
-        img = p_sample(model, schedule, img, t)
+        img = p_sample(model, schedule, img, t, eta)
     return img
 
 # Training loop using SGD (with momentum)
-def train_ddpm(model, schedule, train_loader, device, epochs=20, lr=1e-2, save_dir='./runs', ema_decay=0.995):
+def train_ddim(model, schedule, train_loader, device, epochs=20, lr=1e-2, save_dir='./runs', ema_decay=0.995):
     model = model.to(device)
     opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs*len(train_loader))
@@ -166,7 +206,7 @@ def train_ddpm(model, schedule, train_loader, device, epochs=20, lr=1e-2, save_d
 
         samples = sample_loop(model, schedule, (16,3,32,32), device=device)
         grid = (samples.clamp(-1,1) + 1) / 2.0  # to [0,1]
-        utils.save_image(grid, save_dir / f'samples_epoch_{epoch+1}.png', nrow=4)
+        utils.save_image(grid.cpu(), save_dir / f'samples_epoch_{epoch+1}.png', nrow=4)
         print('Saved samples to', save_dir / f'samples_epoch_{epoch+1}.png')
 
         # restore original weights
