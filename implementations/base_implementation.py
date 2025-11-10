@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import utils
+from .utils.measure import compute_eigenvalues, EigenvectorCache
+from .utils.visualization import save_lambda_max_history
 
 print('torch:', torch.__version__)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -152,7 +154,25 @@ def sample_loop(model, schedule, shape, device, eta=0.0):
     return img
 
 # Training loop using SGD (with momentum)
-def train_ddim(model, schedule, train_loader, device, epochs=20, lr=1e-2, save_dir='./runs', ema_decay=0.995):
+def train_ddim(model, schedule, train_loader, device, epochs=20, lr=1e-2, save_dir='./runs', ema_decay=0.995,
+               compute_lambdamax=False, lambdamax_freq=500, num_eigenvalues=1, use_power_iteration=False):
+    """
+    Training loop for diffusion model with optional Hessian eigenvalue computation.
+    
+    Args:
+        model: The diffusion model (e.g., TinyUNet)
+        schedule: DiffusionSchedule instance
+        train_loader: DataLoader for training data
+        device: torch.device
+        epochs: Number of training epochs
+        lr: Learning rate
+        save_dir: Directory to save checkpoints and samples
+        ema_decay: EMA decay factor (None to disable EMA)
+        compute_lambdamax: If True, compute largest Hessian eigenvalue during training
+        lambdamax_freq: Frequency (in steps) to compute lambda max
+        num_eigenvalues: Number of eigenvalues to compute (default: 1 for lambda max)
+        use_power_iteration: If True, use power iteration instead of LOBPCG
+    """
     model = model.to(device)
     opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs*len(train_loader))
@@ -162,6 +182,12 @@ def train_ddim(model, schedule, train_loader, device, epochs=20, lr=1e-2, save_d
     # EMA params
     ema_params = {n: p.detach().clone() for n,p in model.named_parameters()}
     use_ema = ema_decay is not None
+
+    # Eigenvector cache for warm starts in Hessian computation
+    eigenvector_cache = EigenvectorCache(max_eigenvectors=num_eigenvalues) if compute_lambdamax else None
+
+    # Store lambda max values for visualization
+    lambda_max_history = [] if compute_lambdamax else None
 
     global_step = 0
     for epoch in range(epochs):
@@ -186,7 +212,69 @@ def train_ddim(model, schedule, train_loader, device, epochs=20, lr=1e-2, save_d
 
             running_loss += loss.item()
             global_step += 1
-            if global_step % 200 == 0:
+            
+            # Compute Hessian largest eigenvalue (lambda max) if requested
+            if compute_lambdamax and global_step % lambdamax_freq == 0:
+                # Temporarily set model to eval mode and ensure gradients are enabled
+                model.eval()
+                opt.zero_grad()
+                
+                # Ensure model parameters require gradients for Hessian computation
+                for param in model.parameters():
+                    param.requires_grad = True
+                
+                # Use a batch from the dataset for Hessian computation
+                with torch.enable_grad():
+                    # Compute loss on batch with gradient computation enabled
+                    x_batch = x.detach().requires_grad_(False)
+                    b_batch = x_batch.shape[0]
+                    t_batch = torch.randint(0, schedule.timesteps, (b_batch,), device=device).long()
+                    
+                    # Compute loss - the loss tensor needs to retain computational graph
+                    loss_for_hessian = p_losses(model, schedule, x_batch, t_batch)
+                    
+                    # Compute eigenvalues (largest eigenvalue = lambda max)
+                    try:
+                        eigenvals = compute_eigenvalues(
+                            loss_for_hessian,
+                            model,
+                            k=num_eigenvalues,
+                            max_iterations=100 if not use_power_iteration else 1000,
+                            reltol=1e-2 if num_eigenvalues < 6 else 0.03,
+                            eigenvector_cache=eigenvector_cache,
+                            return_eigenvectors=False,
+                            use_power_iteration=use_power_iteration
+                        )
+                        
+                        if num_eigenvalues == 1:
+                            lambda_max = eigenvals.item()
+                        else:
+                            lambda_max = eigenvals[0].item()
+                        
+                        # Store lambda max value for visualization
+                        if lambda_max_history is not None:
+                            lambda_max_history.append({
+                                'step': global_step,
+                                'epoch': epoch + 1,
+                                'lambda_max': lambda_max,
+                                'loss': loss.item()
+                            })
+                        
+                        print(f'Step {global_step}: Lambda Max = {lambda_max:.6f}')
+                        
+                        # Update progress bar with lambda max
+                        if global_step % 200 == 0:
+                            pbar.set_postfix({
+                                'loss': f'{loss.item():.4f}',
+                                'lr': f'{scheduler.get_last_lr()[0]:.5f}',
+                                'λ_max': f'{lambda_max:.4f}'
+                            })
+                    except Exception as e:
+                        print(f'Warning: Failed to compute lambda max at step {global_step}: {e}')
+                
+                model.train()
+            
+            if global_step % 200 == 0 and not (compute_lambdamax and global_step % lambdamax_freq == 0):
                 pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.5f}'})
 
         avg_loss = running_loss / len(train_loader)
@@ -213,3 +301,12 @@ def train_ddim(model, schedule, train_loader, device, epochs=20, lr=1e-2, save_d
         if use_ema:
             for n,p in model.named_parameters():
                 p.data.copy_(backup[n].to(p.device))
+    
+    # Save lambda max history if computed
+    if lambda_max_history is not None and len(lambda_max_history) > 0:
+        lambda_max_csv_path = save_dir / 'lambda_max_history.csv'
+        save_lambda_max_history(lambda_max_history, str(lambda_max_csv_path))
+        print(f'Saved lambda max history to {lambda_max_csv_path}')
+    
+    # Return lambda max history if computed
+    return lambda_max_history
