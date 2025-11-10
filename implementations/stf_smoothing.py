@@ -1,0 +1,3 @@
+"""
+Implementation 6
+"""
