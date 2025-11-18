@@ -4,6 +4,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import MultiheadAttention
 from torchvision import utils
 from .utils.measure import compute_eigenvalues, EigenvectorCache
 from .utils.visualization import save_lambda_max_history
@@ -12,15 +13,24 @@ print('torch:', torch.__version__)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print('device ->', device)
 
-# Utilities: beta schedules and forward q_sample
-def linear_beta_schedule(timesteps, beta_start=1e-4, beta_end=0.02):
-    return torch.linspace(beta_start, beta_end, timesteps)
+def cosine_beta_schedule(timesteps, s=0.008):
+    """
+    Cosine beta schedule as described in "Improved Denoising Diffusion Probabilistic Models".
+    (https://arxiv.org/abs/2102.09672)
+    """
+    steps = timesteps + 1
+    t = torch.linspace(0, timesteps, steps)
+    f_t = torch.cos(((t / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+    alphas_cumprod = f_t / f_t[0]
+    betas = 1. - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clamp(betas, 0.0001, 0.9999)
 
 class DiffusionSchedule:
     def __init__(self, timesteps=50, device='cpu'):
         self.device = device
         self.timesteps = timesteps
-        betas = linear_beta_schedule(timesteps).to(device)
+        # betas = linear_beta_schedule(timesteps).to(device)
+        betas = cosine_beta_schedule(timesteps).to(device)
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = torch.cat([torch.tensor([1.], device=device), alphas_cumprod[:-1]], dim=0)
@@ -43,51 +53,213 @@ class DiffusionSchedule:
         b = self.sqrt_one_minus_alphas_cumprod[t].view(-1,1,1,1)
         return a * x_start + b * noise
 
-# Minimal UNet-like model adapted for CIFAR-10 (3 channels)
-class TinyUNet(nn.Module):
-    def __init__(self, in_ch=3, base_ch=64, time_emb_dim=128, max_t=50.0):
+# This is the standard, superior method for time encoding.
+class SinusoidalTimeEmbedding(nn.Module):
+    """
+    Standard Sinusoidal Time Embedding, as used in "Attention Is All You Need"
+    and subsequent diffusion models.
+    """
+    def __init__(self, dim, max_t=1000.0):
         super().__init__()
-        self.time_mlp = nn.Sequential(
-            nn.Linear(time_emb_dim, time_emb_dim),
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
-        )
-        self.time_proj = nn.Sequential(
-            nn.Linear(1, time_emb_dim),
-            nn.SiLU(),
-        )
-
-        self.conv1 = nn.Conv2d(in_ch, base_ch, 3, padding=1)
-        self.conv2 = nn.Conv2d(base_ch, base_ch*2, 3, padding=1)
-        self.conv3 = nn.Conv2d(base_ch*2, base_ch*2, 3, padding=1)
-
-        self.deconv1 = nn.ConvTranspose2d(base_ch*2, base_ch*2, 4, stride=2, padding=1)
-        self.deconv2 = nn.ConvTranspose2d(base_ch*2, base_ch, 4, stride=2, padding=1)
-        self.out = nn.Conv2d(base_ch, in_ch, 1)
-
-        self.act = nn.SiLU()
-        self.norm1 = nn.GroupNorm(8, base_ch)
-        self.norm2 = nn.GroupNorm(8, base_ch*2)
-        self.norm3 = nn.GroupNorm(8, base_ch*2)
-
+        self.dim = dim
         self.max_t = max_t
+        
+        # Create a buffer for the frequencies
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
 
+    def forward(self, t):
+        # t: [B] tensor of timesteps
+        t_scaled = t.float() * (1000.0 / self.max_t) # Scale timesteps to a standard range
+        pos_emb = t_scaled.unsqueeze(-1) * self.inv_freq.to(t.device)
+        emb = torch.cat([pos_emb.sin(), pos_emb.cos()], dim=-1) # [B, dim]
+        return emb
+
+# This block adds residual connections and handles time conditioning.
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, time_emb_dim, dropout=0.1):
+        super().__init__()
+        self.act = nn.SiLU()
+        
+        # Time embedding MLP
+        self.time_mlp = nn.Sequential(
+            self.act,
+            nn.Linear(time_emb_dim, out_ch * 2) # Project to gain and bias
+        )
+        
+        # First convolution block (pre-activation)
+        self.norm1 = nn.GroupNorm(8, in_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+        
+        # Second convolution block (pre-activation)
+        self.norm2 = nn.GroupNorm(8, out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
+        
+        # Shortcut connection
+        self.shortcut = nn.Conv2d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
+        
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, temb):
+        # --- Main Path ---
+        h = self.act(self.norm1(x))
+        h = self.conv1(h)
+        
+        # --- Time Conditioning ---
+        # Project time embedding and reshape to (B, C*2, 1, 1)
+        time_bias = self.time_mlp(temb).unsqueeze(-1).unsqueeze(-1)
+        # Split into scale and shift (B, C, 1, 1)
+        scale, shift = time_bias.chunk(2, dim=1)
+        
+        # Apply time conditioning (AdaGN-like)
+        h = self.act(self.norm2(h))
+        h = h * (1 + scale) + shift # Modulate the normalized features
+        
+        h = self.dropout(h)
+        h = self.conv2(h)
+        
+        # --- Add Residual ---
+        return h + self.shortcut(x)
+
+# Standard multi-head attention block for the bottleneck.
+# class SelfAttentionBlock(nn.Module):
+#     def __init__(self, channels, num_heads=4):
+#         super().__init__()
+#         self.channels = channels
+#         self.num_heads = num_heads
+        
+#         self.norm = nn.GroupNorm(8, channels)
+#         # Use built-in MultiheadAttention
+#         self.attn = MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
+
+#     def forward(self, x):
+#         # x: [B, C, H, W]
+#         b, c, h, w = x.shape
+        
+#         # 1. Normalize and flatten
+#         h_norm = self.norm(x)
+#         h_flat = h_norm.reshape(b, c, h * w).permute(0, 2, 1) # [B, H*W, C]
+        
+#         # 2. Apply self-attention
+#         # Query, Key, and Value are all from the same input
+#         attn_output, _ = self.attn(h_flat, h_flat, h_flat) # [B, H*W, C]
+        
+#         # 3. Reshape and add residual
+#         attn_output = attn_output.permute(0, 2, 1).reshape(b, c, h, w) # [B, C, H, W]
+        
+#         return x + attn_output
+
+
+class UNet(nn.Module):
+    """
+    A more robust UNet architecture incorporating:
+    1. Sinusoidal Time Embeddings
+    2. ResNet Blocks with Time Conditioning
+    3. Self-Attention at the bottleneck
+    4. Proper downsampling/upsampling
+    """
+    def __init__(self, in_ch=3, base_ch=128, time_emb_dim=128, max_t=1000.0):
+        super().__init__()
+        self.max_t = max_t
+        
+        # --- 1. Time Embedding ---
+        self.time_emb = SinusoidalTimeEmbedding(time_emb_dim, max_t=max_t)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_emb_dim, time_emb_dim * 2),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 2, time_emb_dim)
+        )
+
+        # --- 2. Down-path ---
+        self.conv_in = nn.Conv2d(in_ch, base_ch, kernel_size=3, padding=1)
+        
+        # 32x32 -> 32x32
+        self.down1_res1 = ResBlock(base_ch, base_ch, time_emb_dim)
+        # self.down1_res2 = ResBlock(base_ch, base_ch, time_emb_dim)
+        
+        # 32x32 -> 16x16
+        self.down2_downsample = nn.Conv2d(base_ch, base_ch * 2, 4, stride=2, padding=1)
+        self.down2_res1 = ResBlock(base_ch * 2, base_ch * 2, time_emb_dim)
+        self.down2_res2 = ResBlock(base_ch * 2, base_ch * 2, time_emb_dim)
+        
+        # 16x16 -> 8x8
+        self.down3_downsample = nn.Conv2d(base_ch * 2, base_ch * 4, 4, stride=2, padding=1)
+        self.down3_res1 = ResBlock(base_ch * 4, base_ch * 4, time_emb_dim)
+        self.down3_res2 = ResBlock(base_ch * 4, base_ch * 4, time_emb_dim)
+
+        # --- 3. Bottleneck ---
+        # 8x8
+        self.mid_res1 = ResBlock(base_ch * 4, base_ch * 4, time_emb_dim)
+        # self.mid_attn = SelfAttentionBlock(base_ch * 4)
+        self.mid_res2 = ResBlock(base_ch * 4, base_ch * 4, time_emb_dim)
+
+        # --- 4. Up-path ---
+        # 8x8 -> 16x16
+        self.up1_deconv = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 4, stride=2, padding=1)
+        self.up1_res1 = ResBlock(base_ch * 4, base_ch * 2, time_emb_dim) # (skip + input)
+        self.up1_res2 = ResBlock(base_ch * 2, base_ch * 2, time_emb_dim)
+
+        # 16x16 -> 32x32
+        self.up2_deconv = nn.ConvTranspose2d(base_ch * 2, base_ch, 4, stride=2, padding=1)
+        self.up2_res1 = ResBlock(base_ch * 2, base_ch, time_emb_dim) # (skip + input)
+        # self.up2_res2 = ResBlock(base_ch, base_ch, time_emb_dim)
+
+        # --- 5. Output ---
+        self.conv_out_norm = nn.GroupNorm(8, base_ch)
+        self.conv_out_act = nn.SiLU()
+        self.conv_out = nn.Conv2d(base_ch, in_ch, kernel_size=1)
+        
     def forward(self, x, t):
-        t = t.float().unsqueeze(-1) / float(self.max_t)
-        temb = self.time_proj(t)
-        h1 = self.act(self.norm1(self.conv1(x)))
-        h2 = F.avg_pool2d(h1, 2)
-        h2 = self.act(self.norm2(self.conv2(h2)))
-        h3 = F.avg_pool2d(h2, 2)
-        h3 = self.act(self.norm3(self.conv3(h3)))
-        te = self.time_mlp(temb).unsqueeze(-1).unsqueeze(-1)
-        h3 = h3 + te
-        u1 = self.act(self.deconv1(h3))
-        u1 = u1 + h2
-        u2 = self.act(self.deconv2(u1))
-        u2 = u2 + h1
-        out = self.out(u2)
+        # x: [B, 3, 32, 32]
+        # t: [B]
+        
+        # 1. Get time embedding
+        temb_sin = self.time_emb(t)
+        temb = self.time_mlp(temb_sin) # [B, time_emb_dim]
+        
+        # 2. Down-path
+        h_in = self.conv_in(x) # [B, base_ch, 32, 32]
+        
+        # --- Block 1 (32x32) ---
+        h1 = self.down1_res1(h_in, temb)
+        # h1 = self.down1_res2(h1, temb)
+        
+        # --- Block 2 (16x16) ---
+        h_down2 = self.down2_downsample(h1)
+        h2 = self.down2_res1(h_down2, temb)
+        h2 = self.down2_res2(h2, temb)
+        
+        # --- Block 3 (8x8) ---
+        h_down3 = self.down3_downsample(h2)
+        h3 = self.down3_res1(h_down3, temb)
+        h3 = self.down3_res2(h3, temb)
+        
+        # 3. Bottleneck
+        h_mid = self.mid_res1(h3, temb)
+        # h_mid = self.mid_attn(h_mid) # Attention block doesn't need temb
+        h_mid = self.mid_res2(h_mid, temb)
+        
+        # 4. Up-path
+        # --- Block Up 1 (16x16) ---
+        u1 = self.up1_deconv(h_mid)
+        # Note the skip connection from h2
+        u1_skip = torch.cat([u1, h2], dim=1) # [B, base_ch*2 + base_ch*2, 16, 16]
+        u1_out = self.up1_res1(u1_skip, temb)
+        u1_out = self.up1_res2(u1_out, temb)
+        
+        # --- Block Up 2 (32x32) ---
+        u2 = self.up2_deconv(u1_out)
+        # Note the skip connection from h1
+        u2_skip = torch.cat([u2, h1], dim=1) # [B, base_ch + base_ch, 32, 32]
+        u2_out = self.up2_res1(u2_skip, temb)
+        # u2_out = self.up2_res2(u2_out, temb)
+        
+        # 5. Output
+        h_out = self.conv_out_act(self.conv_out_norm(u2_out))
+        out = self.conv_out(h_out)
+        
         return out
+
 
 # Loss (MSE on noise) and sampling helpers
 def p_losses(model, schedule, x_start, t):
@@ -154,7 +326,7 @@ def sample_loop(model, schedule, shape, device, eta=0.0):
     return img
 
 # Training loop using SGD (with momentum)
-def train_ddim(model, schedule, train_loader, device, epochs=20, lr=1e-2, save_dir='./runs', ema_decay=0.995,
+def train_ddim(model, schedule, train_loader, device, epochs=20, lr=2e-4, save_dir='./runs', ema_decay=0.995,
                compute_lambdamax=False, lambdamax_freq=500, num_eigenvalues=1, use_power_iteration=False):
     """
     Training loop for diffusion model with optional Hessian eigenvalue computation.
@@ -174,8 +346,10 @@ def train_ddim(model, schedule, train_loader, device, epochs=20, lr=1e-2, save_d
         use_power_iteration: If True, use power iteration instead of LOBPCG
     """
     model = model.to(device)
-    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=0.0)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs*len(train_loader))
+    # opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=0.0)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    final_lr = 1e-7
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs*len(train_loader), eta_min=final_lr)
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -263,7 +437,7 @@ def train_ddim(model, schedule, train_loader, device, epochs=20, lr=1e-2, save_d
                         print(f'Step {global_step}: Lambda Max = {lambda_max:.6f}')
                         
                         # Update progress bar with lambda max
-                        if global_step % 200 == 0:
+                        if global_step % 100 == 0:
                             pbar.set_postfix({
                                 'loss': f'{loss.item():.4f}',
                                 'lr': f'{scheduler.get_last_lr()[0]:.5f}',
@@ -274,7 +448,7 @@ def train_ddim(model, schedule, train_loader, device, epochs=20, lr=1e-2, save_d
                 
                 model.train()
             
-            if global_step % 200 == 0 and not (compute_lambdamax and global_step % lambdamax_freq == 0):
+            if global_step % 100 == 0 and not (compute_lambdamax and global_step % lambdamax_freq == 0):
                 pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.5f}'})
 
         avg_loss = running_loss / len(train_loader)
