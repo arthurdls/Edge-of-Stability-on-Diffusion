@@ -4,8 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import utils
-from .utils.measure import compute_eigenvalues, EigenvectorCache
-from .utils.visualization import save_lambda_max_history
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 torch.backends.cudnn.benchmark = True
 
@@ -192,6 +190,7 @@ class UNet(nn.Module):
         self.down2_downsample = nn.Conv2d(base_ch, base_ch * 2, 4, stride=2, padding=1)
         self.down2_res1 = ResBlock(base_ch * 2, base_ch * 2, time_emb_dim)
         self.down2_res2 = ResBlock(base_ch * 2, base_ch * 2, time_emb_dim)
+        self.down2_attn = SelfAttentionBlock(base_ch * 2)
 
         # 16x16 -> 8x8
         self.down3_downsample = nn.Conv2d(base_ch * 2, base_ch * 4, 4, stride=2, padding=1)
@@ -209,6 +208,7 @@ class UNet(nn.Module):
         self.up1_deconv = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 4, stride=2, padding=1)
         self.up1_res1 = ResBlock(base_ch * 4, base_ch * 2, time_emb_dim) # (skip + input)
         self.up1_res2 = ResBlock(base_ch * 2, base_ch * 2, time_emb_dim)
+        self.up1_attn = SelfAttentionBlock(base_ch * 2)
 
         # 16x16 -> 32x32
         self.up2_deconv = nn.ConvTranspose2d(base_ch * 2, base_ch, 4, stride=2, padding=1)
@@ -239,6 +239,7 @@ class UNet(nn.Module):
         h_down2 = self.down2_downsample(h1)
         h2 = self.down2_res1(h_down2, temb)
         h2 = self.down2_res2(h2, temb)
+        h2 = self.down2_attn(h2)
 
         # --- Block 3 (8x8) ---
         h_down3 = self.down3_downsample(h2)
@@ -257,6 +258,7 @@ class UNet(nn.Module):
         u1_skip = torch.cat([u1, h2], dim=1) # [B, base_ch*2 + base_ch*2, 16, 16]
         u1_out = self.up1_res1(u1_skip, temb)
         u1_out = self.up1_res2(u1_out, temb)
+        u1_out = self.up1_attn(u1_out)
 
         # --- Block Up 2 (32x32) ---
         u2 = self.up2_deconv(u1_out)
@@ -359,11 +361,10 @@ def sample_loop(model, schedule, shape, device, steps=50, eta=0.0):
     return img
 
 # Training loop using SGD (with momentum)
-def train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_dir='./runs', ema_decay=0.995,
-               compute_lambdamax=False, lambdamax_freq=500, num_eigenvalues=1, use_power_iteration=False):
+def train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_dir='./runs', ema_decay=0.995):
     """
-    Training loop for diffusion model with optional Hessian eigenvalue computation.
-    
+    Training loop for diffusion model.
+
     Args:
         model: The diffusion model (e.g., TinyUNet)
         schedule: DiffusionSchedule instance
@@ -373,10 +374,6 @@ def train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_
         lr: Learning rate
         save_dir: Directory to save checkpoints and samples
         ema_decay: EMA decay factor (None to disable EMA)
-        compute_lambdamax: If True, compute largest Hessian eigenvalue during training
-        lambdamax_freq: Frequency (in steps) to compute lambda max
-        num_eigenvalues: Number of eigenvalues to compute (default: 1 for lambda max)
-        use_power_iteration: If True, use power iteration instead of LOBPCG
     """
     model = model.to(device)
 
@@ -393,12 +390,6 @@ def train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_
     scaler = torch.amp.GradScaler('cuda')
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-
-    # Eigenvector cache for warm starts in Hessian computation
-    eigenvector_cache = EigenvectorCache(max_eigenvectors=num_eigenvalues) if compute_lambdamax else None
-
-    # Store lambda max values for visualization
-    lambda_max_history = [] if compute_lambdamax else None
 
     global_step = 0
     for epoch in range(epochs):
@@ -430,63 +421,7 @@ def train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_
             running_loss += loss.item()
             global_step += 1
 
-            # Compute Hessian largest eigenvalue (lambda max) if requested
-            if compute_lambdamax and global_step % lambdamax_freq == 0:
-                # Use a separate evaluation context
-                model.eval()
-                
-                # Prevent OOM: Ensure we don't track history for the inputs
-                with torch.no_grad():
-                    x_batch = x.clone()
-                    t_batch = torch.randint(0, schedule.timesteps, (x_batch.shape[0],), device=device).long()
-
-                # Enable grad ONLY for the loss calculation required for HvP
-                with torch.enable_grad():
-                    # Compute loss - the loss tensor needs to retain computational graph
-                    loss_for_hessian = p_losses(model, schedule, x_batch, t_batch)
-
-                    # Compute eigenvalues (largest eigenvalue = lambda max)
-                    try:
-                        eigenvals = compute_eigenvalues(
-                            loss_for_hessian,
-                            model,
-                            k=num_eigenvalues,
-                            max_iterations=100 if not use_power_iteration else 1000,
-                            reltol=1e-2 if num_eigenvalues < 6 else 0.03,
-                            eigenvector_cache=eigenvector_cache,
-                            return_eigenvectors=False,
-                            use_power_iteration=use_power_iteration
-                        )
-
-                        if num_eigenvalues == 1:
-                            lambda_max = eigenvals.item()
-                        else:
-                            lambda_max = eigenvals[0].item()
-
-                        # Store lambda max value for visualization
-                        if lambda_max_history is not None:
-                            lambda_max_history.append({
-                                'step': global_step,
-                                'epoch': epoch + 1,
-                                'lambda_max': lambda_max,
-                                'loss': loss.item()
-                            })
-
-                        print(f'Step {global_step}: Lambda Max = {lambda_max:.6f}')
-
-                        # Update progress bar with lambda max
-                        if global_step % 100 == 0:
-                            pbar.set_postfix({
-                                'loss': f'{loss.item():.4f}',
-                                'lr': f'{scheduler.get_last_lr()[0]:.5f}',
-                                'λ_max': f'{lambda_max:.4f}'
-                            })
-                    except Exception as e:
-                        print(f'Warning: Failed to compute lambda max at step {global_step}: {e}')
-
-                model.train()
-
-            if global_step % 100 == 0 and not (compute_lambdamax and global_step % lambdamax_freq == 0):
+            if global_step % 100 == 0:
                 pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.5f}'})
 
         avg_loss = running_loss / len(train_loader)
@@ -507,12 +442,3 @@ def train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_
         grid = (samples.clamp(-1,1) + 1) / 2.0  # to [0,1]
         utils.save_image(grid.cpu(), save_dir / f'samples_epoch_{epoch+1}.png', nrow=4)
         print('Saved samples to', save_dir / f'samples_epoch_{epoch+1}.png')
-
-    # Save lambda max history if computed
-    if lambda_max_history is not None and len(lambda_max_history) > 0:
-        lambda_max_csv_path = save_dir / 'lambda_max_history.csv'
-        save_lambda_max_history(lambda_max_history, str(lambda_max_csv_path))
-        print(f'Saved lambda max history to {lambda_max_csv_path}')
-
-    # Return lambda max history if computed
-    return lambda_max_history
