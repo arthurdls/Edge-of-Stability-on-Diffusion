@@ -443,8 +443,7 @@ def train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_
                 # Enable grad ONLY for the loss calculation required for HvP
                 with torch.enable_grad():
                     # Compute loss - the loss tensor needs to retain computational graph
-                    with torch.amp.autocast('cuda'):
-                        loss_for_hessian = p_losses(model, schedule, x_batch, t_batch)
+                    loss_for_hessian = p_losses(model, schedule, x_batch, t_batch)
 
                     # Compute eigenvalues (largest eigenvalue = lambda max)
                     try:
