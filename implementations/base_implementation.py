@@ -305,7 +305,7 @@ def p_sample(model, schedule, x, t, t_prev, eta=0.0):
 
     # 5. Predict x0 (Standard DDPM eq)
     x0_pred = (x - sqrt_one_minus_alpha_bar_t * predicted_noise) / sqrt_alpha_bar_t
-    x0_pred = x0_pred.clamp(-1., 1.)
+    x0_pred = x0_pred.clamp(-1., 1.) # Note that this introduces a non-linearity that isn't present in training
 
     # 6. Direction pointing to x_t (this is the "predicted noise" scaled)
     # Note: DDIM paper allows different "sigma" (eta).
