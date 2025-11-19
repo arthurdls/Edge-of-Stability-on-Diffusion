@@ -199,6 +199,9 @@ def v_param_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-
         ckpt = {
             'model_state': model.state_dict(),
             'ema_state': ema_model.state_dict(), # Built-in state dict
+            'optimizer_state': opt.state_dict(),
+            'scheduler_state': scheduler.state_dict(),
+            'scaler_state': scaler.state_dict(),
             'epoch': epoch+1
         }
         torch.save(ckpt, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
