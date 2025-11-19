@@ -1,5 +1,6 @@
 eos-diffusion/
 tests/data/
 tests/runs_ddpm_sgd/
+tests/runs_ddim/
 implementations/__pycache__/
 implementations/utils/__pycache__/
