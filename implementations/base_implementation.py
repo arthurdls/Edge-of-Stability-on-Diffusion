@@ -160,6 +160,7 @@ class SelfAttentionBlock(nn.Module):
         x_out = x_out.transpose(1, 2).reshape(b, c, h, w) 
         return x + x_out
 
+
 class UNet(nn.Module):
     """
     A more robust UNet architecture incorporating:
@@ -360,7 +361,8 @@ def sample_loop(model, schedule, shape, device, steps=50, eta=0.0):
         img = p_sample(model, schedule, img, t_curr, t_prev, eta)
     return img
 
-# Training loop using SGD (with momentum)
+
+
 def train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_dir='./runs', ema_decay=0.995):
     """
     Training loop for diffusion model.
