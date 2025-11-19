@@ -1,11 +1,33 @@
 """
 Implementation 1
 
-The original code trains the model to predict noise (ε).
-The EDM formulation trains the model (which it calls D_theta)
-    to be part of a larger function F_theta that predicts the clean image (x_0).
+EDM (Elucidating the Design Space of Diffusion-Based Generative Models) Implementation
+Reference: Karras et al., 2022
 
-This "preconditioning" is just a wrapper around the model that scales its inputs and outputs.
+Summary of Changes from Standard DDPM/DDIM:
+
+1.  Continuous Noise Levels (Sigma):
+    - Replaces discrete integer timesteps ($t$) with continuous noise levels ($sigma$).
+    - $sigma$ represents the standard deviation of the noise added to the data.
+
+2.  Preconditioning (The Wrapper):
+    - The neural network $F_theta$ is not trained directly. Instead, it is wrapped
+      to form a denoiser $D_theta(x; sigma)$.
+    - Formula: $D_theta(x; sigma) = c_{skip}(sigma)x + c_{out}(sigma)F_theta(c_{in}(sigma)x; c_{noise}(sigma))$.
+    - This ensures the network inputs and training targets always have unit variance,
+      [cite_start]improving training stability[cite: 353].
+
+3.  Training Objective:
+    - The model predicts the clean image ($x_0$) rather than the noise ($epsilon$).
+    - Training noise levels ($sigma$) are drawn from a Log-Normal distribution
+      to focus training on the most perceptually relevant noise ranges.
+    - Loss is weighted by $lambda(sigma)$ to balance contributions across noise levels.
+
+4.  Deterministic Sampling:
+    - Uses Heun's 2nd Order ODE solver instead of Euler/DDIM.
+    - Reduces the number of steps required for high-quality generation (e.g., 18-35 steps).
+    - Uses a specific time schedule where $sigma(t) = t$.
+
 https://arxiv.org/abs/2206.00364
 """
 from pathlib import Path
