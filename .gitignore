@@ -1,5 +1,6 @@
 eos-diffusion/
 tests/data/
-tests/runs_ddpm_sgd/
 implementations/__pycache__/
 implementations/utils/__pycache__/
+*.pt
+samples_epoch_*.png
