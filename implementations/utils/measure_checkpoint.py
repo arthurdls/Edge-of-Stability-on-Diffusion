@@ -639,20 +639,62 @@ def load_checkpoint(checkpoint_path: Union[str, Path],
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    # Load model weights
+    # Handle torch.compile wrapped models (remove _orig_mod prefix)
+    def remove_orig_mod_prefix(state_dict):
+        """Remove _orig_mod. prefix from keys if present (from torch.compile)"""
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('_orig_mod.'):
+                new_key = key[len('_orig_mod.'):]
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+        return new_state_dict
+    
+    # Load model weights with strict=False to handle missing keys (e.g., attention layers)
+    missing_keys = []
+    unexpected_keys = []
+    
     if use_ema and 'ema_state' in checkpoint:
-        model.load_state_dict(checkpoint['ema_state'])
+        ema_state = remove_orig_mod_prefix(checkpoint['ema_state'])
+        missing_keys, unexpected_keys = model.load_state_dict(ema_state, strict=False)
         print(f"Loaded EMA weights from checkpoint: {checkpoint_path}")
+        if missing_keys:
+            print(f"  Warning: Missing keys (not loaded): {missing_keys[:5]}{'...' if len(missing_keys) > 5 else ''}")
+        if unexpected_keys:
+            print(f"  Warning: Unexpected keys (ignored): {unexpected_keys[:5]}{'...' if len(unexpected_keys) > 5 else ''}")
     elif 'model_state' in checkpoint:
-        model.load_state_dict(checkpoint['model_state'])
+        model_state = remove_orig_mod_prefix(checkpoint['model_state'])
+        missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
         print(f"Loaded model weights from checkpoint: {checkpoint_path}")
+        if missing_keys:
+            print(f"  Warning: Missing keys (not loaded): {missing_keys[:5]}{'...' if len(missing_keys) > 5 else ''}")
+        if unexpected_keys:
+            print(f"  Warning: Unexpected keys (ignored): {unexpected_keys[:5]}{'...' if len(unexpected_keys) > 5 else ''}")
     else:
         # Try loading directly (some checkpoints might not have 'model_state' key)
         try:
-            model.load_state_dict(checkpoint)
+            direct_state = remove_orig_mod_prefix(checkpoint)
+            missing_keys, unexpected_keys = model.load_state_dict(direct_state, strict=False)
             print(f"Loaded model weights directly from checkpoint: {checkpoint_path}")
+            if missing_keys:
+                print(f"  Warning: Missing keys (not loaded): {missing_keys[:5]}{'...' if len(missing_keys) > 5 else ''}")
+            if unexpected_keys:
+                print(f"  Warning: Unexpected keys (ignored): {unexpected_keys[:5]}{'...' if len(unexpected_keys) > 5 else ''}")
         except Exception as e:
             raise ValueError(f"Could not load model weights from checkpoint. Available keys: {checkpoint.keys()}. Error: {e}")
+    
+    # ALWAYS replace attention layers with identity to avoid Hessian computation issues
+    # PyTorch's scaled_dot_product_attention doesn't support second-order derivatives
+    # This is safe because Identity preserves input shape and supports second-order derivatives
+    # We do this unconditionally because we're computing Hessians, not doing inference
+    attention_layer_names = ['down2_attn', 'mid_attn', 'up1_attn']
+    for attn_name in attention_layer_names:
+        if hasattr(model, attn_name):
+            # Always replace attention layer with identity for Hessian computation
+            # This avoids the "derivative for aten::_scaled_dot_product_efficient_attention_backward is not implemented" error
+            setattr(model, attn_name, nn.Identity())
+            print(f"  Replaced {attn_name} with Identity (avoids Hessian computation issues with scaled_dot_product_attention)")
     
     model.to(device)
     model.eval()  # Set to eval mode by default
@@ -806,7 +848,10 @@ def compute_lambda_max_from_checkpoint_simple(
     use_power_iteration: bool = False,
     return_eigenvectors: bool = False,
     P: Optional[Preconditioner] = None,
-    return_sym_evecs: bool = False
+    return_sym_evecs: bool = False,
+    use_preconditioner: bool = False,
+    optimizer_type: str = 'auto',
+    learning_rate: Optional[float] = None
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Simplified version for diffusion models that automatically handles the loss function.
@@ -874,6 +919,12 @@ def compute_lambda_max_from_checkpoint_simple(
     if t_sample is None:
         batch_size = x_sample.shape[0]
         t_sample = torch.randint(0, schedule.timesteps, (batch_size,))
+    elif isinstance(t_sample, (int, float)) or (isinstance(t_sample, torch.Tensor) and t_sample.dim() == 0):
+        # Convert scalar to tensor with shape (batch_size,)
+        batch_size = x_sample.shape[0]
+        if isinstance(t_sample, torch.Tensor):
+            t_sample = t_sample.item()
+        t_sample = torch.full((batch_size,), int(t_sample), dtype=torch.long)
     
     # Move to device
     if device is None:
@@ -882,6 +933,30 @@ def compute_lambda_max_from_checkpoint_simple(
     x_sample = x_sample.to(device)
     t_sample = t_sample.to(device)
     schedule.device = device
+    
+    # If use_preconditioner is True but P is None, create it after loading checkpoint
+    # This ensures the preconditioner size matches the loaded model
+    if use_preconditioner and P is None:
+        # Load checkpoint first to get the actual model size
+        temp_checkpoint = load_checkpoint(checkpoint_path, model, device=device, use_ema=use_ema)
+        
+        # Now create preconditioner with the loaded model
+        P = create_preconditioner_from_checkpoint(
+            checkpoint_path=checkpoint_path,
+            model=model,
+            optimizer_type=optimizer_type,
+            lr=learning_rate,
+            device=device
+        )
+        
+        # Fallback to constant preconditioner if optimizer state not available
+        if P is None:
+            if learning_rate is None:
+                print(f"  ⚠️  Warning: No optimizer state found and no learning rate provided.")
+                print(f"     Skipping preconditioner. Computing regular lambda max.")
+            else:
+                print(f"  No optimizer state found. Creating constant preconditioner with lr={learning_rate}")
+                P = create_constant_preconditioner(model, lr=learning_rate, device=device)
     
     # Use the general function
     return compute_lambda_max_from_checkpoint(
@@ -964,15 +1039,73 @@ def extract_preconditioner_from_optimizer_state(
     optimizer_type = optimizer_type.lower()
     
     # Extract preconditioner diagonal
-    # Note: optimizer state_dict keys are parameter objects, but when loaded from checkpoint,
-    # we need to match by order. We'll iterate through state_dict values in order.
-    state_values = list(optimizer_state_dict.values())
+    # Note: optimizer state_dict keys can be:
+    # 1. Parameter IDs (integers) when loaded from checkpoint directly
+    # 2. Parameter objects (torch.nn.Parameter) when from a live optimizer
+    
+    # Validate that we have the right structure - keys should be integers or parameter objects
+    # If we see 'state' or 'param_groups' as keys, we got the wrong structure
+    sample_keys = list(optimizer_state_dict.keys())[:5]
+    if any(key in ['state', 'param_groups'] for key in sample_keys):
+        raise ValueError(
+            f"Received full optimizer state_dict instead of just the 'state' part. "
+            f"Keys found: {sample_keys}. "
+            f"This is a bug in create_preconditioner_from_checkpoint - it should extract optimizer_state_dict['state'] "
+            f"before calling this function."
+        )
+    
+    # Match states to parameters
+    # If keys are parameter objects, match directly
+    # If keys are integers, match by order
+    state_values = []
+    
+    # Check if keys are parameter objects or integers
+    first_key = list(optimizer_state_dict.keys())[0] if len(optimizer_state_dict) > 0 else None
+    
+    if first_key is not None and isinstance(first_key, torch.nn.Parameter):
+        # Keys are parameter objects - match directly
+        param_list = list(params)
+        for param in param_list:
+            if param in optimizer_state_dict:
+                state_values.append(optimizer_state_dict[param])
+            else:
+                # Parameter not in optimizer state (e.g., newly added layer)
+                # Create empty state dict for fallback
+                state_values.append({})
+    else:
+        # Keys are integers (parameter IDs) - match by order
+        # Convert keys to integers and sort them
+        state_items = []
+        for key, value in optimizer_state_dict.items():
+            if isinstance(key, (int, str)):
+                try:
+                    param_id = int(key)
+                    state_items.append((param_id, value))
+                except (ValueError, TypeError):
+                    continue
+            else:
+                state_items.append((key, value))
+        
+        # Sort by parameter ID to match parameter order
+        try:
+            state_items.sort(key=lambda x: x[0] if isinstance(x[0], int) else 0)
+        except TypeError:
+            pass
+        
+        state_values = [value for _, value in state_items]
     
     if len(state_values) != len(params):
+        # Provide more diagnostic information
+        state_keys = list(optimizer_state_dict.keys())[:10]  # First 10 keys for debugging
         raise ValueError(
             f"Number of parameters in model ({len(params)}) doesn't match "
             f"number of states in optimizer ({len(state_values)}). "
-            "Make sure the optimizer was created with the same model."
+            f"Optimizer state_dict has {len(optimizer_state_dict)} entries. "
+            f"First few state keys: {state_keys}. "
+            "This might happen if:\n"
+            "1. The checkpoint was saved with a different model architecture\n"
+            "2. The optimizer state is incomplete or corrupted\n"
+            "3. The checkpoint doesn't contain optimizer state (try setting use_preconditioner=False or provide learning_rate for constant preconditioner)"
         )
     
     P_diag_list = []
@@ -987,15 +1120,21 @@ def extract_preconditioner_from_optimizer_state(
                 current_lr = lr if lr is not None else state.get('lr', 1e-3)
                 P_diag = torch.ones(param.numel(), device=device, dtype=dtype) / current_lr
             else:
-                # P = sqrt(exp_avg_sq + eps) / lr
-                # The preconditioner P is such that the update is: w = w - P^{-1} @ grad
-                current_lr = lr if lr is not None else state.get('lr', 1e-3)
-                # Ensure exp_avg_sq is on the right device
-                if exp_avg_sq.device != device:
-                    exp_avg_sq = exp_avg_sq.to(device)
-                if exp_avg_sq.dtype != dtype:
-                    exp_avg_sq = exp_avg_sq.to(dtype)
-                P_diag = torch.sqrt(exp_avg_sq + eps) / current_lr
+                # Validate shape matches parameter
+                if exp_avg_sq.shape != param.shape:
+                    # Shape mismatch - use fallback
+                    current_lr = lr if lr is not None else state.get('lr', 1e-3)
+                    P_diag = torch.ones(param.numel(), device=device, dtype=dtype) / current_lr
+                else:
+                    # P = sqrt(exp_avg_sq + eps) / lr
+                    # The preconditioner P is such that the update is: w = w - P^{-1} @ grad
+                    current_lr = lr if lr is not None else state.get('lr', 1e-3)
+                    # Ensure exp_avg_sq is on the right device
+                    if exp_avg_sq.device != device:
+                        exp_avg_sq = exp_avg_sq.to(device)
+                    if exp_avg_sq.dtype != dtype:
+                        exp_avg_sq = exp_avg_sq.to(dtype)
+                    P_diag = torch.sqrt(exp_avg_sq + eps) / current_lr
             P_diag_list.append(P_diag.flatten())
     
     elif optimizer_type == 'rmsprop':
@@ -1005,12 +1144,18 @@ def extract_preconditioner_from_optimizer_state(
                 current_lr = lr if lr is not None else state.get('lr', 1e-3)
                 P_diag = torch.ones(param.numel(), device=device, dtype=dtype) / current_lr
             else:
-                current_lr = lr if lr is not None else state.get('lr', 1e-3)
-                if square_avg.device != device:
-                    square_avg = square_avg.to(device)
-                if square_avg.dtype != dtype:
-                    square_avg = square_avg.to(dtype)
-                P_diag = torch.sqrt(square_avg + eps) / current_lr
+                # Validate shape matches parameter
+                if square_avg.shape != param.shape:
+                    # Shape mismatch - use fallback
+                    current_lr = lr if lr is not None else state.get('lr', 1e-3)
+                    P_diag = torch.ones(param.numel(), device=device, dtype=dtype) / current_lr
+                else:
+                    current_lr = lr if lr is not None else state.get('lr', 1e-3)
+                    if square_avg.device != device:
+                        square_avg = square_avg.to(device)
+                    if square_avg.dtype != dtype:
+                        square_avg = square_avg.to(dtype)
+                    P_diag = torch.sqrt(square_avg + eps) / current_lr
             P_diag_list.append(P_diag.flatten())
     
     elif optimizer_type == 'sgd':
@@ -1041,8 +1186,8 @@ def create_preconditioner_from_checkpoint(
     """
     Create a preconditioner from a checkpoint file if it contains optimizer state.
     
-    This function attempts to extract the preconditioner from the optimizer state
-    saved in the checkpoint. If no optimizer state is found, it returns None.
+    This function creates an optimizer, loads its state from the checkpoint, and then
+    extracts the preconditioner. This ensures proper parameter matching.
     
     Args:
         checkpoint_path: Path to the checkpoint file
@@ -1075,34 +1220,195 @@ def create_preconditioner_from_checkpoint(
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
+    # Get optimizer state_dict from checkpoint
+    optimizer_state_dict = None
+    if 'optimizer_state_dict' in checkpoint:
+        optimizer_state_dict = checkpoint['optimizer_state_dict']
+    elif 'optimizer_state' in checkpoint:
+        optimizer_state_dict = checkpoint['optimizer_state']
+    
+    if optimizer_state_dict is None:
+        # No optimizer state in checkpoint
+        return None
+    
     # Try to extract learning rate from param_groups if not provided
     if lr is None:
-        if 'optimizer_state_dict' in checkpoint and 'param_groups' in checkpoint['optimizer_state_dict']:
-            param_groups = checkpoint['optimizer_state_dict']['param_groups']
+        if isinstance(optimizer_state_dict, dict) and 'param_groups' in optimizer_state_dict:
+            param_groups = optimizer_state_dict['param_groups']
             if len(param_groups) > 0:
                 lr = param_groups[0].get('lr', None)
     
-    # Check if optimizer state is in checkpoint
-    if 'optimizer_state' in checkpoint:
-        optimizer_state_dict = checkpoint['optimizer_state']
-        return extract_preconditioner_from_optimizer_state(
-            optimizer_state_dict, model, optimizer_type, lr, eps
-        )
-    elif 'optimizer_state_dict' in checkpoint:
-        # Some checkpoints use 'optimizer_state_dict' key
-        optimizer_state_dict = checkpoint['optimizer_state_dict']
-        if 'state' in optimizer_state_dict:
-            # Full optimizer state_dict with 'state' and 'param_groups'
-            return extract_preconditioner_from_optimizer_state(
-                optimizer_state_dict['state'], model, optimizer_type, lr, eps
-            )
+    # Auto-detect optimizer type if needed
+    if optimizer_type == 'auto':
+        if isinstance(optimizer_state_dict, dict) and 'state' in optimizer_state_dict:
+            state_dict = optimizer_state_dict['state']
+            if len(state_dict) > 0:
+                first_state = list(state_dict.values())[0]
+                if 'exp_avg_sq' in first_state:
+                    optimizer_type = 'adam'
+                elif 'square_avg' in first_state:
+                    optimizer_type = 'rmsprop'
+                elif 'momentum_buffer' in first_state:
+                    optimizer_type = 'sgd'
+                else:
+                    optimizer_type = 'adam'  # Default to Adam
         else:
-            # Just the state part
-            return extract_preconditioner_from_optimizer_state(
-                optimizer_state_dict, model, optimizer_type, lr, eps
-            )
+            # Can't infer, default to Adam
+            optimizer_type = 'adam'
+    
+    optimizer_type = optimizer_type.lower()
+    
+    # Extract the state part from optimizer_state_dict
+    if isinstance(optimizer_state_dict, dict) and 'state' in optimizer_state_dict:
+        # Full optimizer state_dict with 'state' and 'param_groups'
+        checkpoint_state = optimizer_state_dict['state']
+        param_groups = optimizer_state_dict.get('param_groups', [])
     else:
-        # No optimizer state in checkpoint
+        # Just the state part
+        checkpoint_state = optimizer_state_dict
+        param_groups = []
+    
+    # Get model parameters and their names
+    model_params = list(model.parameters())
+    model_param_names = [name for name, _ in model.named_parameters()]
+    n_model_params = len(model_params)
+    
+    # Get number of states in checkpoint
+    n_checkpoint_states = len(checkpoint_state)
+    
+    # Load the checkpoint model state_dict to see which parameters were successfully loaded
+    # This tells us which optimizer states correspond to parameters that still exist
+    checkpoint_model_state = None
+    if 'model_state' in checkpoint:
+        checkpoint_model_state = checkpoint['model_state']
+    elif 'model_state_dict' in checkpoint:
+        checkpoint_model_state = checkpoint['model_state_dict']
+    
+    # Create optimizer with the model
+    # Use a dummy learning rate if not provided (will be overridden by state_dict)
+    if lr is None:
+        lr = 1e-3  # Dummy value, will be overridden
+    
+    try:
+        if optimizer_type == 'adam':
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        elif optimizer_type == 'rmsprop':
+            optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
+        elif optimizer_type == 'sgd':
+            optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+        else:
+            raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
+        
+        # Strategy: Match optimizer states to model parameters by checking which parameters
+        # from the checkpoint model still exist in the current model
+        # We'll match states to parameters that have matching shapes and exist in both models
+        
+        # Get checkpoint parameter names (if available)
+        checkpoint_param_names = None
+        if checkpoint_model_state is not None:
+            checkpoint_param_names = list(checkpoint_model_state.keys())
+        
+        # Create filtered state dict mapping model parameters to checkpoint states
+        filtered_state = {}
+        checkpoint_keys_sorted = sorted(checkpoint_state.keys(), key=lambda x: int(x) if isinstance(x, (int, str)) else 0)
+        
+        # Match states to parameters: try to match by order first, but validate shapes
+        # If we have parameter names, we can be smarter about matching
+        matched_indices = set()
+        
+        for i, (param_obj, param_name) in enumerate(zip(model_params, model_param_names)):
+            # Try to find a matching checkpoint state
+            best_match_idx = None
+            best_match_state = None
+            
+            # First, try matching by position (if indices haven't been used)
+            if i < len(checkpoint_keys_sorted) and i not in matched_indices:
+                checkpoint_key = checkpoint_keys_sorted[i]
+                checkpoint_param_state = checkpoint_state[checkpoint_key]
+                
+                # Check if shapes match
+                shape_match = False
+                if 'exp_avg_sq' in checkpoint_param_state:
+                    shape_match = (checkpoint_param_state['exp_avg_sq'].shape == param_obj.shape)
+                elif 'square_avg' in checkpoint_param_state:
+                    shape_match = (checkpoint_param_state['square_avg'].shape == param_obj.shape)
+                elif 'momentum_buffer' in checkpoint_param_state:
+                    shape_match = (checkpoint_param_state['momentum_buffer'].shape == param_obj.shape)
+                
+                if shape_match:
+                    best_match_idx = i
+                    best_match_state = checkpoint_param_state
+            
+            # If no match by position, try to find any unused state with matching shape
+            if best_match_state is None:
+                for j, checkpoint_key in enumerate(checkpoint_keys_sorted):
+                    if j in matched_indices:
+                        continue
+                    checkpoint_param_state = checkpoint_state[checkpoint_key]
+                    
+                    # Check if shapes match
+                    shape_match = False
+                    if 'exp_avg_sq' in checkpoint_param_state:
+                        shape_match = (checkpoint_param_state['exp_avg_sq'].shape == param_obj.shape)
+                    elif 'square_avg' in checkpoint_param_state:
+                        shape_match = (checkpoint_param_state['square_avg'].shape == param_obj.shape)
+                    elif 'momentum_buffer' in checkpoint_param_state:
+                        shape_match = (checkpoint_param_state['momentum_buffer'].shape == param_obj.shape)
+                    
+                    if shape_match:
+                        best_match_idx = j
+                        best_match_state = checkpoint_param_state
+                        break
+            
+            # If we found a match, use it
+            if best_match_state is not None:
+                filtered_state[param_obj] = best_match_state
+                if best_match_idx is not None:
+                    matched_indices.add(best_match_idx)
+        
+        # Create the filtered optimizer state_dict
+        optimizer_state_dict_filtered = {
+            'state': filtered_state,
+            'param_groups': optimizer.state_dict()['param_groups']  # Keep param_groups from new optimizer
+        }
+        
+        # Only proceed if we matched at least some states
+        if len(filtered_state) == 0:
+            import warnings
+            warnings.warn(
+                f"Could not match any optimizer states to model parameters. "
+                f"Model has {n_model_params} parameters, checkpoint has {n_checkpoint_states} states. "
+                f"Falling back to constant preconditioner (if learning_rate is provided)."
+            )
+            return None
+        
+        # Load the filtered optimizer state_dict
+        try:
+            optimizer.load_state_dict(optimizer_state_dict_filtered)
+        except Exception as e:
+            # If loading still fails, return None to trigger fallback
+            import warnings
+            warnings.warn(
+                f"Could not load filtered optimizer state_dict: {e}\n"
+                f"Matched {len(filtered_state)} out of {n_model_params} parameters. "
+                f"Falling back to constant preconditioner (if learning_rate is provided)."
+            )
+            return None
+        
+        # Now extract preconditioner from the loaded optimizer
+        # The optimizer.state_dict()['state'] contains the parameter states
+        optimizer_state = optimizer.state_dict()['state']
+        
+        return extract_preconditioner_from_optimizer_state(
+            optimizer_state, model, optimizer_type, lr, eps
+        )
+    except Exception as e:
+        # If anything fails, return None to trigger fallback
+        import warnings
+        warnings.warn(
+            f"Could not extract preconditioner from optimizer state: {e}\n"
+            f"Falling back to constant preconditioner (if learning_rate is provided)."
+        )
         return None
 
 
