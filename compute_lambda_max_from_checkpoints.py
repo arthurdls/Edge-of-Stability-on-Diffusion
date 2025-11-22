@@ -412,7 +412,7 @@ def main():
     batch_size = 4
     image_size = (3, 32, 32)  # CIFAR-10
     timesteps = 1000
-    t_samples = [0, 99, 199, 299, 399, 499, 599, 699, 799, 899, 999]  # Multiple timesteps to compute lambda max for
+    t_samples = [99, 199, 299, 399, 499, 599, 699, 799, 899, 999]  # Multiple timesteps to compute lambda max for
     max_iterations = 100
     reltol = 1e-2
     use_power_iteration = False  # Use LOBPCG by default (faster)
