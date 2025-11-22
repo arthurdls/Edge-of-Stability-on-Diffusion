@@ -1,3 +1,0 @@
-"""
-Implementation 4
-"""
