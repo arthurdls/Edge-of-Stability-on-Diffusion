@@ -68,6 +68,7 @@ EPOCHS = 100
 print("--- SETTINGS ---")
 print(f"LR: {LR}")
 print(f"Epochs: {EPOCHS}")
+print(f"Batch size: 128")
 print(f"Timesteps: {TIMESTEPS}")
 
 
@@ -103,6 +104,7 @@ if BASE:
         **train_settings
     )
 
+
 if EDM:
     print("Running EDM Implementation")
     seed_everything()
@@ -130,6 +132,7 @@ if VPARAM:
         **train_settings
     )
 
+
 if SNR:
     print("Running SNR Implementation")
     seed_everything()
@@ -143,6 +146,7 @@ if SNR:
         save_dir=save_dir,
         **train_settings
     )
+
 
 if PD:
     print("Running PD Implementation")
@@ -158,6 +162,7 @@ if PD:
         **train_settings
     )
 
+
 if ADAP_S:
     print("Running ADAP_S Implementation")
     seed_everything()
@@ -171,6 +176,7 @@ if ADAP_S:
         save_dir=save_dir,
         **train_settings
     )
+
 
 if STF:
     print("Running STF Implementation")
