@@ -167,13 +167,11 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
 
             opt.zero_grad()
 
-            # --- 2. Autocast Context ---
             # Runs the forward pass in FP16 (half precision) where safe, 
             # but keeps critical ops (like softmax or reductions) in FP32.
             with torch.amp.autocast('cuda'):
                 loss = p_losses(model, schedule, x, t)
 
-            # --- 3. Scale and Step ---
             # Scales loss to prevent underflow in FP16 gradients
             scaler.scale(loss).backward()
             scaler.step(opt)
