@@ -200,7 +200,8 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
             'scheduler_state': scheduler.state_dict(),
             'scaler_state': scaler.state_dict(),
             'epoch': epoch+1,
-            'curriculum_stage': pacer.current_stage # Save curriculum state
+            'curriculum_stage': pacer.current_stage, # Save curriculum state
+            'avg_epoch_loss': avg_loss
         }
         torch.save(ckpt, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
 

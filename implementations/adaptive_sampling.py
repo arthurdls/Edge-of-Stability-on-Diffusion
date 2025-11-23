@@ -200,7 +200,8 @@ def adaptive_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e
             'scaler_state': scaler.state_dict(),
             'sampler_state': sampler_model.state_dict(), # Save sampler
             'sampler_optimizer_state': sampler_opt.state_dict(), # Save optimizer
-            'epoch': epoch+1
+            'epoch': epoch+1,
+            'avg_epoch_loss': avg_loss
         }
         torch.save(ckpt, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
 

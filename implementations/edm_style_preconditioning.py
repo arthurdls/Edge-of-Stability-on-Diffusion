@@ -191,7 +191,8 @@ def edm_train_ddim(model, train_loader, device, epochs=100, lr=2e-4, save_dir='.
             'optimizer_state': opt.state_dict(),
             'scheduler_state': scheduler.state_dict(),
             'scaler_state': scaler.state_dict(),
-            'epoch': epoch+1
+            'epoch': epoch+1,
+            'avg_epoch_loss': avg_loss
         }
         torch.save(ckpt, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
 
