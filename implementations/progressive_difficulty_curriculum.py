@@ -134,7 +134,6 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
         model = torch.compile(model, mode="reduce-overhead")
 
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    final_lr = 1e-7
     scaler = torch.amp.GradScaler('cuda')
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)

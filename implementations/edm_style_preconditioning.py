@@ -146,7 +146,6 @@ def edm_train_ddim(model, train_loader, device, epochs=100, lr=2e-4, save_dir='.
         model = torch.compile(model, mode="reduce-overhead")
 
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    final_lr = 1e-7
     scaler = torch.amp.GradScaler('cuda')
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
