@@ -63,6 +63,8 @@ ADAP_S = True
 STF = True
 
 LR = 1e-3
+TEST_NAME_ADD_ON = '_lr_1e-3'
+
 TIMESTEPS = 1000
 EPOCHS = 100
 print("--- SETTINGS ---")
@@ -95,7 +97,7 @@ if BASE:
     seed_everything()
     model = base.UNet(**unet_setting)
     schedule = base.DiffusionSchedule(**schedule_settings)
-    save_dir = './test_base'
+    save_dir = './test_base' + TEST_NAME_ADD_ON
     print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
     base.train_ddim(
         model=model,
@@ -109,7 +111,7 @@ if EDM:
     print("Running EDM Implementation")
     seed_everything()
     model = edm.UNet(**unet_setting)
-    save_dir = './test_edm_preconditioning'
+    save_dir = './test_edm_preconditioning' + TEST_NAME_ADD_ON
     print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
     edm.edm_train_ddim(
         model=model,
@@ -123,7 +125,7 @@ if VPARAM:
     seed_everything()
     model = vparam.UNet(**unet_setting)
     schedule = vparam.DiffusionSchedule(**schedule_settings)
-    save_dir = './test_v_parametrization'
+    save_dir = './test_v_parametrization' + TEST_NAME_ADD_ON
     print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
     vparam.v_param_train_ddim(
         model=model,
@@ -138,7 +140,7 @@ if SNR:
     seed_everything()
     model = snr.UNet(**unet_setting)
     schedule = snr.MinSNRDiffusionSchedule(**schedule_settings)
-    save_dir = './test_min_snr_reweighting'
+    save_dir = './test_min_snr_reweighting' + TEST_NAME_ADD_ON
     print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
     snr.min_snr_train_ddim(
         model=model,
@@ -153,7 +155,7 @@ if PD:
     seed_everything()
     model = pd.UNet(**unet_setting)
     schedule = pd.DiffusionSchedule(**schedule_settings)
-    save_dir = './test_progressive_difficulty'
+    save_dir = './test_progressive_difficulty' + TEST_NAME_ADD_ON
     print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
     pd.progressive_train_ddim(
         model=model,
@@ -168,7 +170,7 @@ if ADAP_S:
     seed_everything()
     model = adap_s.UNet(**unet_setting)
     schedule = adap_s.DiffusionSchedule(**schedule_settings)
-    save_dir = './test_adaptive_sampling'
+    save_dir = './test_adaptive_sampling' + TEST_NAME_ADD_ON
     print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
     adap_s.adaptive_train_ddim(
         model=model,
@@ -183,7 +185,7 @@ if STF:
     seed_everything()
     model = stf.UNet(**unet_setting)
     schedule = stf.DiffusionSchedule(**schedule_settings)
-    save_dir = './test_stf_smoothing'
+    save_dir = './test_stf_smoothing' + TEST_NAME_ADD_ON
     print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
     stf.stf_train_ddim(
         model=model,
