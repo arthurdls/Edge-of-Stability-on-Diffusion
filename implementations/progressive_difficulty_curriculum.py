@@ -135,7 +135,6 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
 
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     final_lr = 1e-7
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs*len(train_loader), eta_min=final_lr)
     scaler = torch.amp.GradScaler('cuda')
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -176,7 +175,6 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
-            scheduler.step()
 
             # Curriculum Update
             # Update the pacer with current loss to check for convergence
@@ -186,7 +184,7 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
             global_step += 1
 
             if global_step % 100 == 0:
-                pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.5f}'})
+                pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{lr}'})
 
         avg_loss = running_loss / len(train_loader)
         print(f'End epoch {epoch+1}, avg loss {avg_loss:.4f}')
@@ -195,7 +193,6 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
         ckpt = {
             'model_state': model.state_dict(),
             'optimizer_state': opt.state_dict(),
-            'scheduler_state': scheduler.state_dict(),
             'scaler_state': scaler.state_dict(),
             'epoch': epoch+1,
             'curriculum_stage': pacer.current_stage, # Save curriculum state
