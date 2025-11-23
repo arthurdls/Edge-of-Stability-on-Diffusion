@@ -31,7 +31,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import utils
-from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 torch.backends.cudnn.benchmark = True
 
 from implementations.base_implementation import (
@@ -69,7 +68,7 @@ class TimestepSampler(nn.Module):
         return torch.distributions.Beta(alpha, beta)
 
 
-def adaptive_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_dir='./runs', ema_decay=0.995):
+def adaptive_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_dir='./runs'):
     """
     Training loop for diffusion model.
 
@@ -81,7 +80,6 @@ def adaptive_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e
         epochs: Number of training epochs
         lr: Learning rate
         save_dir: Directory to save checkpoints and samples
-        ema_decay: EMA decay factor (None to disable EMA)
     """
     model = model.to(device)
 
@@ -89,12 +87,11 @@ def adaptive_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e
         print("Compiling model...")
         model = torch.compile(model, mode="reduce-overhead")
 
-    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay), device=device, use_buffers=True)
-
     sampler_model = TimestepSampler(in_channels=3).to(device)
-    sampler_opt = torch.optim.Adam(sampler_model.parameters(), lr=1e-3) 
-    sampler_freq = 40  # f_S: Update sampler every 40 steps
-    subset_size = 3    # |S|: Size of timestep subset for approximation
+    sampler_lr = 1e-3
+    sampler_opt = torch.optim.Adam(sampler_model.parameters(), lr=sampler_lr)
+    sampler_freq = 40   # f_S: Update sampler every 40 steps
+    subset_size = 3     # |S|: Size of timestep subset for approximation
     entropy_coef = 1e-2 # Entropy regularization coefficient
 
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -162,8 +159,6 @@ def adaptive_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e
             scaler.update()
             scheduler.step()
 
-            ema_model.update_parameters(model)
-
             # Sampler Update
             if should_update_sampler:
                 loss_S_after = 0
@@ -197,10 +192,9 @@ def adaptive_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e
         avg_loss = running_loss / len(train_loader)
         print(f'End epoch {epoch+1}, avg loss {avg_loss:.4f}')
 
-        # save checkpoint (model + ema)
+        # save checkpoint
         ckpt = {
             'model_state': model.state_dict(),
-            'ema_state': ema_model.state_dict(), # Built-in state dict
             'optimizer_state': opt.state_dict(),
             'scheduler_state': scheduler.state_dict(),
             'scaler_state': scaler.state_dict(),
@@ -210,9 +204,8 @@ def adaptive_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e
         }
         torch.save(ckpt, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
 
-        # sample and save a grid using EMA weights for nicer samples
-        ema_model.eval()
-        samples = sample_loop(ema_model, schedule, (16,3,32,32), device=device, steps=100)
+        model.eval()
+        samples = sample_loop(model, schedule, (16,3,32,32), device=device, steps=100)
 
         grid = (samples.clamp(-1,1) + 1) / 2.0  # to [0,1]
         utils.save_image(grid.cpu(), save_dir / f'samples_epoch_{epoch+1}.png', nrow=4)

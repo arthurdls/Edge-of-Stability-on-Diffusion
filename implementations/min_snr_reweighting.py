@@ -32,7 +32,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import utils
-from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 torch.backends.cudnn.benchmark = True
 
 from implementations.base_implementation import (
@@ -93,7 +92,7 @@ def min_snr_loss(model, schedule, x_start, t, snr_gamma=5.0):
     return (loss * mse_loss_weights).mean()
 
 
-def min_snr_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_dir='./runs', ema_decay=0.995):
+def min_snr_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_dir='./runs'):
     """
     Training loop for diffusion model.
 
@@ -105,7 +104,6 @@ def min_snr_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-
         epochs: Number of training epochs
         lr: Learning rate
         save_dir: Directory to save checkpoints and samples
-        ema_decay: EMA decay factor (None to disable EMA)
     """
     model = model.to(device)
 
@@ -113,9 +111,6 @@ def min_snr_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-
         print("Compiling model...")
         model = torch.compile(model, mode="reduce-overhead")
 
-    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay), device=device, use_buffers=True)
-
-    # opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=0.0)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     final_lr = 1e-7
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs*len(train_loader), eta_min=final_lr)
@@ -148,8 +143,6 @@ def min_snr_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-
             scaler.update()
             scheduler.step()
 
-            ema_model.update_parameters(model)
-
             running_loss += loss.item()
             global_step += 1
 
@@ -159,10 +152,9 @@ def min_snr_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-
         avg_loss = running_loss / len(train_loader)
         print(f'End epoch {epoch+1}, avg loss {avg_loss:.4f}')
 
-        # save checkpoint (model + ema)
+        # save checkpoint
         ckpt = {
             'model_state': model.state_dict(),
-            'ema_state': ema_model.state_dict(), # Built-in state dict
             'optimizer_state': opt.state_dict(),
             'scheduler_state': scheduler.state_dict(),
             'scaler_state': scaler.state_dict(),
@@ -170,9 +162,8 @@ def min_snr_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-
         }
         torch.save(ckpt, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
 
-        # sample and save a grid using EMA weights for nicer samples
-        ema_model.eval()
-        samples = sample_loop(ema_model, schedule, (16,3,32,32), device=device, steps=100)
+        model.eval()
+        samples = sample_loop(model, schedule, (16,3,32,32), device=device, steps=100)
 
         grid = (samples.clamp(-1,1) + 1) / 2.0  # to [0,1]
         utils.save_image(grid.cpu(), save_dir / f'samples_epoch_{epoch+1}.png', nrow=4)
