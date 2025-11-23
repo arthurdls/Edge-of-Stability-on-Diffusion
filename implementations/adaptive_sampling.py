@@ -2,7 +2,7 @@
 Implementation 5
 
 Adaptive Non-uniform Timestep Sampling for Standard Diffusion (DDPM)
-[cite_start]Reference: Kim et al., 2025 [cite: 1]
+Reference: Kim et al., 2025
 
 Summary of Changes from Standard Training:
 
@@ -45,7 +45,7 @@ class TimestepSampler(nn.Module):
     """
     def __init__(self, in_channels=3, hidden_dim=128):
         super().__init__()
-        # Lightweight encoder as suggested in Appendix Table 7 [cite: 558]
+        # Lightweight encoder as suggested in Appendix Table 7 
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1),
             nn.SiLU(),
@@ -56,7 +56,7 @@ class TimestepSampler(nn.Module):
             nn.Linear(64, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, 2),
-            nn.Softplus() # Ensures alpha and beta are positive [cite: 245]
+            nn.Softplus() # Ensures alpha and beta are positive 
         )
 
     def forward(self, x):
@@ -126,7 +126,7 @@ def adaptive_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e
 
             # Look-Ahead Preparation (Algorithm 2)
             # To approximate Delta (reward), we need loss *before* update on a subset S.
-            # Only done every f_S steps to save compute[cite: 239].
+            # Only done every f_S steps to save compute.
             should_update_sampler = (global_step % sampler_freq == 0) and (global_step > 0)
 
             loss_S_before = 0
@@ -176,12 +176,12 @@ def adaptive_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e
                             l_post = p_losses(model, schedule, x, t_s)
                         loss_S_after += l_post
 
-                # Reward = Reduction in loss (Loss_before - Loss_after) [cite: 252]
+                # Reward = Reduction in loss (Loss_before - Loss_after) 
                 # We average over batch and subset
                 reward = (loss_S_before - loss_S_after) / subset_size
 
                 # Policy Gradient Loss: Maximize reward => Minimize -1 * reward * log_prob
-                # Plus Entropy Regularization to prevent premature convergence [cite: 254]
+                # Plus Entropy Regularization to prevent premature convergence
                 entropy = dist.entropy().mean()
                 sampler_loss = -(reward * log_prob) - (entropy_coef * entropy)
 
