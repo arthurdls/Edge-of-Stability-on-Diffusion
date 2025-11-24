@@ -62,135 +62,135 @@ PD = True
 ADAP_S = True
 STF = True
 
-LR = 1e-3
-TEST_NAME_ADD_ON = '_lr_1e-3'
+LR_dict = {
+    1e-3: '_lr_1e-3',
+    1e-4: '_lr_1e-4',
+    1e-5: '_lr_1e-5',
+    # 5e-4: '_lr_5e-4',
+    # 5e-5: '_lr_5e-5',
+}
 
 TIMESTEPS = 1000
 EPOCHS = 100
-print("--- SETTINGS ---")
-print(f"LR: {LR}")
-print(f"Epochs: {EPOCHS}")
-print(f"Batch size: 128")
-print(f"Timesteps: {TIMESTEPS}")
-
-
-unet_setting = {
-    'in_ch':3,
-    'base_ch':64,
-    'time_emb_dim':64
-}
-schedule_settings = {
-    'timesteps':TIMESTEPS,
-    'device':DEVICE
-}
-train_settings = {
-    'train_loader':train_loader,
-    'device':DEVICE,
-    'epochs':EPOCHS,
-    'lr':LR,
-}
 
 print("--- RUNNING IMPLEMENTATIONS ---")
+for LR, TEST_NAME_ADD_ON in LR_dict.items():
+    print("--- SETTINGS ---")
+    print(f"LR: {LR}")
+    print(f"Epochs: {EPOCHS}")
+    print(f"Batch size: 128")
+    print(f"Timesteps: {TIMESTEPS}")
 
-if BASE:
-    print("Running BASE Implementation")
-    seed_everything()
-    model = base.UNet(**unet_setting)
-    schedule = base.DiffusionSchedule(**schedule_settings)
-    save_dir = './test_base' + TEST_NAME_ADD_ON
-    print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
-    base.train_ddim(
-        model=model,
-        schedule=schedule,
-        save_dir=save_dir,
-        **train_settings
-    )
+    unet_setting = {
+        'in_ch':3,
+        'base_ch':64,
+        'time_emb_dim':64
+    }
+    schedule_settings = {
+        'timesteps':TIMESTEPS,
+        'device':DEVICE
+    }
+    train_settings = {
+        'train_loader':train_loader,
+        'device':DEVICE,
+        'epochs':EPOCHS,
+        'lr':LR,
+    }
 
+    if BASE:
+        print("Running BASE Implementation")
+        seed_everything()
+        model = base.UNet(**unet_setting)
+        schedule = base.DiffusionSchedule(**schedule_settings)
+        save_dir = './test_base' + TEST_NAME_ADD_ON
+        print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
+        base.train_ddim(
+            model=model,
+            schedule=schedule,
+            save_dir=save_dir,
+            **train_settings
+        )
 
-if EDM:
-    print("Running EDM Implementation")
-    seed_everything()
-    model = edm.UNet(**unet_setting)
-    save_dir = './test_edm_preconditioning' + TEST_NAME_ADD_ON
-    print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
-    edm.edm_train_ddim(
-        model=model,
-        save_dir=save_dir,
-        **train_settings
-    )
+    if EDM:
+        print("Running EDM Implementation")
+        seed_everything()
+        model = edm.UNet(**unet_setting)
+        save_dir = './test_edm_preconditioning' + TEST_NAME_ADD_ON
+        print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
+        edm.edm_train_ddim(
+            model=model,
+            save_dir=save_dir,
+            **train_settings
+        )
 
+    if VPARAM:
+        print("Running VPARAM Implementation")
+        seed_everything()
+        model = vparam.UNet(**unet_setting)
+        schedule = vparam.DiffusionSchedule(**schedule_settings)
+        save_dir = './test_v_parametrization' + TEST_NAME_ADD_ON
+        print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
+        vparam.v_param_train_ddim(
+            model=model,
+            schedule=schedule,
+            save_dir=save_dir,
+            **train_settings
+        )
 
-if VPARAM:
-    print("Running VPARAM Implementation")
-    seed_everything()
-    model = vparam.UNet(**unet_setting)
-    schedule = vparam.DiffusionSchedule(**schedule_settings)
-    save_dir = './test_v_parametrization' + TEST_NAME_ADD_ON
-    print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
-    vparam.v_param_train_ddim(
-        model=model,
-        schedule=schedule,
-        save_dir=save_dir,
-        **train_settings
-    )
+    if SNR:
+        print("Running SNR Implementation")
+        seed_everything()
+        model = snr.UNet(**unet_setting)
+        schedule = snr.MinSNRDiffusionSchedule(**schedule_settings)
+        save_dir = './test_min_snr_reweighting' + TEST_NAME_ADD_ON
+        print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
+        snr.min_snr_train_ddim(
+            model=model,
+            schedule=schedule,
+            save_dir=save_dir,
+            **train_settings
+        )
 
+    if PD:
+        print("Running PD Implementation")
+        seed_everything()
+        model = pd.UNet(**unet_setting)
+        schedule = pd.DiffusionSchedule(**schedule_settings)
+        save_dir = './test_progressive_difficulty' + TEST_NAME_ADD_ON
+        print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
+        pd.progressive_train_ddim(
+            model=model,
+            schedule=schedule,
+            save_dir=save_dir,
+            **train_settings
+        )
 
-if SNR:
-    print("Running SNR Implementation")
-    seed_everything()
-    model = snr.UNet(**unet_setting)
-    schedule = snr.MinSNRDiffusionSchedule(**schedule_settings)
-    save_dir = './test_min_snr_reweighting' + TEST_NAME_ADD_ON
-    print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
-    snr.min_snr_train_ddim(
-        model=model,
-        schedule=schedule,
-        save_dir=save_dir,
-        **train_settings
-    )
+    if ADAP_S:
+        print("Running ADAP_S Implementation")
+        seed_everything()
+        model = adap_s.UNet(**unet_setting)
+        schedule = adap_s.DiffusionSchedule(**schedule_settings)
+        save_dir = './test_adaptive_sampling' + TEST_NAME_ADD_ON
+        print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
+        adap_s.adaptive_train_ddim(
+            model=model,
+            schedule=schedule,
+            save_dir=save_dir,
+            **train_settings
+        )
 
-
-if PD:
-    print("Running PD Implementation")
-    seed_everything()
-    model = pd.UNet(**unet_setting)
-    schedule = pd.DiffusionSchedule(**schedule_settings)
-    save_dir = './test_progressive_difficulty' + TEST_NAME_ADD_ON
-    print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
-    pd.progressive_train_ddim(
-        model=model,
-        schedule=schedule,
-        save_dir=save_dir,
-        **train_settings
-    )
-
-
-if ADAP_S:
-    print("Running ADAP_S Implementation")
-    seed_everything()
-    model = adap_s.UNet(**unet_setting)
-    schedule = adap_s.DiffusionSchedule(**schedule_settings)
-    save_dir = './test_adaptive_sampling' + TEST_NAME_ADD_ON
-    print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
-    adap_s.adaptive_train_ddim(
-        model=model,
-        schedule=schedule,
-        save_dir=save_dir,
-        **train_settings
-    )
-
-
-if STF:
-    print("Running STF Implementation")
-    seed_everything()
-    model = stf.UNet(**unet_setting)
-    schedule = stf.DiffusionSchedule(**schedule_settings)
-    save_dir = './test_stf_smoothing' + TEST_NAME_ADD_ON
-    print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
-    stf.stf_train_ddim(
-        model=model,
-        schedule=schedule,
-        save_dir=save_dir,
-        **train_settings
-    )
-print("--- ALL IMPLEMENTATIONS FINISHED ----")
+    if STF:
+        print("Running STF Implementation")
+        seed_everything()
+        model = stf.UNet(**unet_setting)
+        schedule = stf.DiffusionSchedule(**schedule_settings)
+        save_dir = './test_stf_smoothing' + TEST_NAME_ADD_ON
+        print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
+        stf.stf_train_ddim(
+            model=model,
+            schedule=schedule,
+            save_dir=save_dir,
+            **train_settings
+        )
+    print(f"--- ALL IMPLEMENTATIONS FINISHED FOR LR = {LR} ----")
+print("--- ALL IMPLEMENTATIONS FINISHED FOR ALL LR ----")
