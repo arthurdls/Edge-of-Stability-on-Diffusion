@@ -1,11 +1,7 @@
 eos-diffusion/
 data/
 tests/data/
-tests/runs_ddpm_sgd/
-tests/runs_ddim/
-tests/runs_ddim_test_base_implementation/
-tests/runs_ddim_test_edm_preconditioning/
-tests/runs_ddim_test_min_snr_reweighting/
-tests/runs_ddim_test_progressive_difficulty_curriculum/
 implementations/__pycache__/
 implementations/utils/__pycache__/
+*.pt
+samples_epoch_*.png
