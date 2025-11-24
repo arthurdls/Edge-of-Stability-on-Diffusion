@@ -405,7 +405,7 @@ def main():
     """Main function to run the script."""
     # Configuration
 
-    checkpoint_dir = "tests/runs_ddim_test_progressive_difficulty_curriculum"
+    checkpoint_dir = "tests/test_progressive_difficulty_lr_1e-3"
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Parameters for lambda max computation
@@ -430,7 +430,7 @@ def main():
     # - For SGD (edm_style_preconditioning.py): typically 1e-2
     # - For Adam (base_implementation.py): typically 2e-4
     # If your checkpoints have optimizer state, this will be ignored
-    learning_rate = 2e-4
+    learning_rate = 1e-3
     
     print("=" * 60)
     print("Computing Lambda Max from Checkpoints")

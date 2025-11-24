@@ -7,5 +7,13 @@ tests/runs_ddim_test_base_implementation/
 tests/runs_ddim_test_edm_preconditioning/
 tests/runs_ddim_test_min_snr_reweighting/
 tests/runs_ddim_test_progressive_difficulty_curriculum/
+tests/test_stf_smoothing_lr_1e-3/
+tests/test_adaptive_sampling_lr_1e-3/
+tests/test_v_parametrization_lr_1e-3/
+tests/test_min_snr_reweighting_lr_1e-3/
+tests/test_base_lr_1e-5/
+tests/test_base_lr_1e-3/
+tests/test_base_lr_1e-4/
+tests/test_edm_preconditioning_lr_1e-3/
 implementations/__pycache__/
 implementations/utils/__pycache__/

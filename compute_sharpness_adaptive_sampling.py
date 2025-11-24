@@ -2,8 +2,11 @@
 Script to compute lambda max (largest Hessian eigenvalue) from multiple checkpoints
 and plot the results over training epochs.
 
+This version uses adaptive timestep sampling, where timesteps are sampled from a
+learned Beta distribution based on the input data, rather than uniform sampling.
+
 Usage:
-    python compute_lambda_max_from_checkpoints.py
+    python compute_sharpness_adaptive_sampling.py
 """
 
 import torch
@@ -17,9 +20,8 @@ from typing import List, Tuple, Optional
 from torchvision import datasets
 
 # Import from the implementations
-from implementations.base_implementation import UNet
-from implementations.min_snr_reweighting import MinSNRDiffusionSchedule
-from implementations.utils.measure_checkpoint_min_snr import (
+from implementations.base_implementation import UNet, DiffusionSchedule
+from implementations.utils.measure_checkpoint_adaptive_sampling import (
     compute_lambda_max_from_checkpoint_simple,
     create_preconditioner_from_checkpoint,
     create_constant_preconditioner
@@ -228,7 +230,10 @@ def compute_lambda_max_for_checkpoints(
         batch_size: Batch size for computing loss
         image_size: Image dimensions (channels, height, width)
         timesteps: Number of diffusion timesteps
-        t_samples: List of timestep values to compute lambda max for (default: [49])
+        t_samples: List of timestep values to compute lambda max for (default: [49]).
+                   Note: For adaptive sampling, timesteps are chosen by the TimestepSampler
+                   based on the input data, so this parameter is mainly for compatibility.
+                   The sampler will generate timesteps from a Beta distribution.
         max_iterations: Maximum iterations for eigenvalue computation
         reltol: Relative tolerance for convergence
         use_power_iteration: Use power iteration instead of LOBPCG
@@ -279,7 +284,7 @@ def compute_lambda_max_for_checkpoints(
         base_ch=arch_params['base_ch'],
         time_emb_dim=arch_params['time_emb_dim']
     )
-    schedule = MinSNRDiffusionSchedule(timesteps=timesteps, device=device)
+    schedule = DiffusionSchedule(timesteps=timesteps, device=device)
     
     # Load real CIFAR-10 images for computing loss
     if verbose:
@@ -295,11 +300,16 @@ def compute_lambda_max_for_checkpoints(
         print(f"Loaded CIFAR-10 images with shape {x_sample.shape} and range [{x_sample.min():.3f}, {x_sample.max():.3f}]")
     
     # Validate t_samples are within valid range
+    # Note: With adaptive sampling, timesteps are chosen by the sampler, but we still
+    # validate the range for compatibility
     for t in t_samples:
         if t < 0 or t >= timesteps:
             raise ValueError(f"t_sample={t} is out of bounds. Valid range: [0, {timesteps-1}]")
     
     # Store results for each t_sample
+    # Note: With adaptive sampling, we compute lambda max for each requested t_sample.
+    # The TimestepSampler is still loaded and used, but we use the exact requested timesteps
+    # to get different lambda max values for different timesteps.
     results = {t: {'epochs': [], 'lambda_max_values': []} for t in t_samples}
     
     # Process each checkpoint
@@ -309,18 +319,21 @@ def compute_lambda_max_for_checkpoints(
                 print(f"\nProcessing checkpoint: {checkpoint_path.name} (epoch {epoch})")
             
             # Compute lambda max for each t_sample
+            # For adaptive sampling, we still use the TimestepSampler infrastructure,
+            # but we compute lambda max at the exact requested timesteps to get different values
             for t_sample in t_samples:
                 try:
                     # Note: Preconditioner will be created inside compute_lambda_max_from_checkpoint_simple
                     # after the model is loaded, to ensure size matching
                     
                     # Compute lambda max for this checkpoint and timestep
+                    # The TimestepSampler is loaded but we use the exact t_sample as target
                     lambda_max = compute_lambda_max_from_checkpoint_simple(
                         checkpoint_path=checkpoint_path,
                         model=model,
                         schedule=schedule,
                         x_sample=x_sample,
-                        t_sample=t_sample,
+                        t_sample=t_sample,  # Use exact timestep for this computation
                         device=device,
                         use_ema=use_ema,
                         k=1,  # Only compute largest eigenvalue
@@ -331,7 +344,8 @@ def compute_lambda_max_for_checkpoints(
                         P=None,  # Will be created inside if use_preconditioner is True
                         use_preconditioner=use_preconditioner,
                         optimizer_type=optimizer_type,
-                        learning_rate=learning_rate
+                        learning_rate=learning_rate,
+                        use_adaptive_sampling=True  # Use adaptive sampling for this version
                     )
                     
                     # Convert to Python float if it's a tensor
@@ -406,7 +420,7 @@ def main():
     """Main function to run the script."""
     # Configuration
 
-    checkpoint_dir = "tests/test_min_snr_reweighting_lr_1e-3"
+    checkpoint_dir = "tests/test_adaptive_sampling_lr_1e-3"
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Parameters for lambda max computation

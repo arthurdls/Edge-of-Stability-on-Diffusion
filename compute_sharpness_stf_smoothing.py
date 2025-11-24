@@ -1,9 +1,11 @@
 """
 Script to compute lambda max (largest Hessian eigenvalue) from multiple checkpoints
-and plot the results over training epochs.
+and plot the results over training epochs for STF (Stable Target Field) smoothing.
+
+This script uses the STF loss function instead of the standard DDIM loss.
 
 Usage:
-    python compute_lambda_max_from_checkpoints.py
+    python compute_sharpness_stf_smoothing.py
 """
 
 import torch
@@ -17,9 +19,8 @@ from typing import List, Tuple, Optional
 from torchvision import datasets
 
 # Import from the implementations
-from implementations.base_implementation import UNet
-from implementations.min_snr_reweighting import MinSNRDiffusionSchedule
-from implementations.utils.measure_checkpoint_min_snr import (
+from implementations.base_implementation import UNet, DiffusionSchedule
+from implementations.utils.measure_checkpoint_stf_smoothing import (
     compute_lambda_max_from_checkpoint_simple,
     create_preconditioner_from_checkpoint,
     create_constant_preconditioner
@@ -279,7 +280,7 @@ def compute_lambda_max_for_checkpoints(
         base_ch=arch_params['base_ch'],
         time_emb_dim=arch_params['time_emb_dim']
     )
-    schedule = MinSNRDiffusionSchedule(timesteps=timesteps, device=device)
+    schedule = DiffusionSchedule(timesteps=timesteps, device=device)
     
     # Load real CIFAR-10 images for computing loss
     if verbose:
@@ -406,7 +407,7 @@ def main():
     """Main function to run the script."""
     # Configuration
 
-    checkpoint_dir = "tests/test_min_snr_reweighting_lr_1e-3"
+    checkpoint_dir = "tests/test_stf_smoothing_lr_1e-3"
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Parameters for lambda max computation
@@ -431,7 +432,7 @@ def main():
     # - For SGD (edm_style_preconditioning.py): typically 1e-2
     # - For Adam (base_implementation.py): typically 2e-4
     # If your checkpoints have optimizer state, this will be ignored
-    learning_rate = 1e-3
+    learning_rate = 1e-5
     
     print("=" * 60)
     print("Computing Lambda Max from Checkpoints")
