@@ -37,6 +37,9 @@ torch.backends.cudnn.benchmark = True
 from implementations.base_implementation import (
     UNet, sample_loop, cosine_beta_schedule)
 
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from implementations.utils.AEoSAnalyzer import AEoSAnalyzer
+
 class MinSNRDiffusionSchedule:
     def __init__(self, timesteps=1000, device='cpu'):
         self.device = device
@@ -92,6 +95,44 @@ def min_snr_loss(model, schedule, x_start, t, snr_gamma=5.0):
     return (loss * mse_loss_weights).mean()
 
 
+@torch.compiler.disable
+def measure_aeos_step(model, opt, analyzer, global_step, lr, monitor_timesteps, schedule, device, x, t, current_avg_loss):
+    """
+    Helper function to run the AEoS measurement in strict eager mode.
+    """
+    measure_bs = 32
+
+    # We still need the math backend for higher-order derivatives
+    with sdpa_kernel([SDPBackend.MATH]):
+        for ts_req in monitor_timesteps:
+            torch.cuda.empty_cache()
+
+            # 1. Prepare Data
+            if ts_req == 'random':
+                t_measure = t[:measure_bs]
+                x_measure = x[:measure_bs]
+                ts_label = "random"
+            else:
+                t_measure = torch.full((measure_bs,), ts_req, device=device).long()
+                x_measure = x[:measure_bs]
+                ts_label = f"t={ts_req}"
+
+            # 2. Forward Pass (Eager Mode)
+            loss_measure = min_snr_loss(model, schedule, x_measure, t_measure)
+
+            # 3. Analyze
+            bs, lmax = analyzer.log_step(
+                model, opt, loss_measure, global_step, lr,
+                timestep_label=ts_label, average_loss=current_avg_loss
+            )
+
+            print(f"  [{ts_label}] Batch Sharpness: {bs:.4f} | Lambda Max (P^-1 H): {lmax:.4f}")
+            del loss_measure
+
+    print(f"  Stability Threshold (38/Eta): {38.0/lr:.4f}")
+    torch.cuda.empty_cache()
+
+
 def min_snr_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_dir='./runs'):
     """
     Training loop for diffusion model.
@@ -106,19 +147,25 @@ def min_snr_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-
         save_dir: Directory to save checkpoints and samples
     """
     model = model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     if hasattr(torch, 'compile'):
         print("Compiling model...")
-        model = torch.compile(model, mode="reduce-overhead")
+        compiled_model = torch.compile(model)
+    else:
+        compiled_model = model
 
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler('cuda')
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    analyzer = AEoSAnalyzer(save_dir)
+    monitor_timesteps = ['random', 1, 100, 200, 300, 400, 500, 600, 700, 800, 999]
+
     global_step = 0
+    interval_loss = 0.0
     for epoch in range(epochs):
-        model.train()
+        compiled_model.train()
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}')
         running_loss = 0.0
         for i, (x, _) in enumerate(pbar):
@@ -128,10 +175,23 @@ def min_snr_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-
 
             opt.zero_grad()
 
+            # --- AEoS Measurement Check ---
+            if global_step > 0 and global_step % 500 == 0:
+                print(f"\n[Step {global_step}] Measuring AEoS...")
+
+                current_avg_loss = interval_loss / 500
+                interval_loss = 0.0 # reset every 500 intervals
+
+                measure_aeos_step(
+                     model, opt, analyzer, global_step, lr,
+                     monitor_timesteps, schedule, device, x, t,
+                    current_avg_loss
+                )
+
             # Runs the forward pass in FP16 (half precision) where safe, 
             # but keeps critical ops (like softmax or reductions) in FP32.
             with torch.amp.autocast('cuda'):
-                loss = min_snr_loss(model, schedule, x, t)
+                loss = min_snr_loss(compiled_model, schedule, x, t)
 
             # Scales loss to prevent underflow in FP16 gradients
             scaler.scale(loss).backward()
@@ -139,6 +199,7 @@ def min_snr_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-
             scaler.update()
 
             running_loss += loss.item()
+            interval_loss += loss.item()
             global_step += 1
 
             if global_step % 100 == 0:
@@ -155,10 +216,11 @@ def min_snr_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-
             'epoch': epoch+1,
             'avg_epoch_loss': avg_loss
         }
-        torch.save(ckpt, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
+        # torch.save(ckpt, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
+        torch.save(ckpt, save_dir / f'latest.pt')
 
-        model.eval()
-        samples = sample_loop(model, schedule, (16,3,32,32), device=device, steps=100)
+        compiled_model.eval()
+        samples = sample_loop(compiled_model, schedule, (16,model.in_ch,32,32), device=device, steps=100)
 
         grid = (samples.clamp(-1,1) + 1) / 2.0  # to [0,1]
         utils.save_image(grid.cpu(), save_dir / f'samples_epoch_{epoch+1}.png', nrow=4)

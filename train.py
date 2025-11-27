@@ -34,16 +34,15 @@ def get_dataloaders(batch_size=128, img_size=32, num_workers=4):
     transform = transforms.Compose([
         transforms.Resize(img_size),
         transforms.ToTensor(),
-        # transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5)), # map to [-1, 1] for CIFAR10
-        transforms.Normalize((0.5,), (0.5,)),  # map to [-1,1] for MNIST
+        transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5)), # map to [-1, 1] for CIFAR10
+        # transforms.Normalize((0.5,), (0.5,)),  # map to [-1,1] for MNIST
     ])
-    train_ds = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-    test_ds = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    train_ds = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+    test_ds = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     return train_loader, test_loader
 
-train_loader, test_loader = get_dataloaders(batch_size=128, img_size=32, num_workers=2)
 
 # Helper to show saved sample grid
 from PIL import Image
@@ -64,27 +63,31 @@ STF = True
 
 LR_dict = {
     1e-3: '_lr_1e-3',
-    1e-4: '_lr_1e-4',
-    1e-5: '_lr_1e-5',
     5e-4: '_lr_5e-4',
+    1e-4: '_lr_1e-4',
     5e-5: '_lr_5e-5',
+    1e-5: '_lr_1e-5',
 }
 
 TIMESTEPS = 1000
 EPOCHS = 200
+BATCH_SIZE = 128
+
+print("--- LOADING DATA ---")
+train_loader, test_loader = get_dataloaders(batch_size=BATCH_SIZE, img_size=32, num_workers=2)
 
 print("--- RUNNING IMPLEMENTATIONS ---")
 for LR, TEST_NAME_ADD_ON in LR_dict.items():
     print("--- SETTINGS ---")
     print(f"LR: {LR}")
     print(f"Epochs: {EPOCHS}")
-    print(f"Batch size: 128")
+    print(f"Batch size: {BATCH_SIZE}")
     print(f"Timesteps: {TIMESTEPS}")
 
     unet_setting = {
-        'in_ch':1, # 1 for MNIST, 3 for CIFAR10
-        'base_ch':32, # 32 for MNIST, 64 for CIFAR10
-        'time_emb_dim':32, # 32 for MNIST, 64 for CIFAR10
+        'in_ch':3, # 1 for MNIST, 3 for CIFAR10
+        'base_ch':32, # 32 for MNIST and for CIFAR10
+        'time_emb_dim':32, # 32 for MNIST and for CIFAR10
     }
     schedule_settings = {
         'timesteps':TIMESTEPS,

@@ -5,10 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import utils
 torch.backends.cudnn.benchmark = True
-
-print('torch:', torch.__version__)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print('device ->', device)
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from implementations.utils.AEoSAnalyzer import AEoSAnalyzer
 
 def cosine_beta_schedule(timesteps, s=0.008):
     """
@@ -168,8 +166,10 @@ class UNet(nn.Module):
     3. Self-Attention at the bottleneck
     4. Proper downsampling/upsampling
     """
-    def __init__(self, in_ch=3, base_ch=64, time_emb_dim=64):
+    def __init__(self, in_ch=1, base_ch=32, time_emb_dim=32):
         super().__init__()
+
+        self.in_ch = in_ch
 
         # --- 1. Time Embedding ---
         self.time_emb = SinusoidalTimeEmbedding(time_emb_dim)
@@ -361,6 +361,43 @@ def sample_loop(model, schedule, shape, device, steps=50, eta=0.0):
     return img
 
 
+@torch.compiler.disable
+def measure_aeos_step(model, opt, analyzer, global_step, lr, monitor_timesteps, schedule, device, x, t, current_avg_loss):
+    """
+    Helper function to run the AEoS measurement in strict eager mode.
+    """
+    measure_bs = 32
+
+    # We still need the math backend for higher-order derivatives
+    with sdpa_kernel([SDPBackend.MATH]):
+        for ts_req in monitor_timesteps:
+            torch.cuda.empty_cache()
+
+            # 1. Prepare Data
+            if ts_req == 'random':
+                t_measure = t[:measure_bs]
+                x_measure = x[:measure_bs]
+                ts_label = "random"
+            else:
+                t_measure = torch.full((measure_bs,), ts_req, device=device).long()
+                x_measure = x[:measure_bs]
+                ts_label = f"t={ts_req}"
+
+            # 2. Forward Pass (Eager Mode)
+            loss_measure = p_losses(model, schedule, x_measure, t_measure)
+
+            # 3. Analyze
+            bs, lmax = analyzer.log_step(
+                model, opt, loss_measure, global_step, lr,
+                timestep_label=ts_label, average_loss=current_avg_loss
+            )
+
+            print(f"  [{ts_label}] Batch Sharpness: {bs:.4f} | Lambda Max (P^-1 H): {lmax:.4f}")
+            del loss_measure
+
+    print(f"  Stability Threshold (38/Eta): {38.0/lr:.4f}")
+    torch.cuda.empty_cache()
+
 
 def train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_dir='./runs'):
     """
@@ -376,19 +413,25 @@ def train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_
         save_dir: Directory to save checkpoints and samples
     """
     model = model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     if hasattr(torch, 'compile'):
         print("Compiling model...")
-        model = torch.compile(model, mode="reduce-overhead")
+        compiled_model = torch.compile(model)
+    else:
+        compiled_model = model
 
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler('cuda')
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    analyzer = AEoSAnalyzer(save_dir)
+    monitor_timesteps = ['random', 1, 100, 200, 300, 400, 500, 600, 700, 800, 999]
+
     global_step = 0
+    interval_loss = 0.0
     for epoch in range(epochs):
-        model.train()
+        compiled_model.train()
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}')
         running_loss = 0.0
         for i, (x, _) in enumerate(pbar):
@@ -398,10 +441,23 @@ def train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_
 
             opt.zero_grad()
 
-            # Runs the forward pass in FP16 (half precision) where safe, 
+            # --- AEoS Measurement Check ---
+            if global_step > 0 and global_step % 500 == 0:
+                print(f"\n[Step {global_step}] Measuring AEoS...")
+
+                current_avg_loss = interval_loss / 500
+                interval_loss = 0.0 # reset every 500 intervals
+
+                measure_aeos_step(
+                     model, opt, analyzer, global_step, lr,
+                     monitor_timesteps, schedule, device, x, t,
+                    current_avg_loss
+                )
+
+            # Runs the forward pass in FP16 (half precision) where safe,
             # but keeps critical ops (like softmax or reductions) in FP32.
             with torch.amp.autocast('cuda'):
-                loss = p_losses(model, schedule, x, t)
+                loss = p_losses(compiled_model, schedule, x, t)
 
             # Scales loss to prevent underflow in FP16 gradients
             scaler.scale(loss).backward()
@@ -409,6 +465,7 @@ def train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_
             scaler.update()
 
             running_loss += loss.item()
+            interval_loss += loss.item()
             global_step += 1
 
             if global_step % 100 == 0:
@@ -425,10 +482,11 @@ def train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_
             'epoch': epoch+1,
             'avg_epoch_loss': avg_loss
         }
-        torch.save(ckpt, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
+        # torch.save(ckpt, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
+        torch.save(ckpt, save_dir / f'latest.pt')
 
-        model.eval()
-        samples = sample_loop(model, schedule, (16,3,32,32), device=device, steps=100)
+        compiled_model.eval()
+        samples = sample_loop(compiled_model, schedule, (16,model.in_ch,32,32), device=device, steps=100)
 
         grid = (samples.clamp(-1,1) + 1) / 2.0  # to [0,1]
         utils.save_image(grid.cpu(), save_dir / f'samples_epoch_{epoch+1}.png', nrow=4)

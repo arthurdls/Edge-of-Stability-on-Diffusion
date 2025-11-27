@@ -33,10 +33,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import utils
 torch.backends.cudnn.benchmark = True
+import csv
 
 from implementations.base_implementation import (
     DiffusionSchedule, UNet, sample_loop, p_losses)
 
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from implementations.utils.AEoSAnalyzer import AEoSAnalyzer
 
 class CurriculumPacer:
     """
@@ -48,12 +51,21 @@ class CurriculumPacer:
     2. Starts with the easiest cluster (highest noise/timesteps).
     3. Expands to include harder clusters (lower timesteps) when loss converges.
     """
-    def __init__(self, total_timesteps=1000, num_clusters=20, max_patience=200, smoothing=0.99):
+    def __init__(self, total_timesteps=1000, num_clusters=20, max_patience=200, smoothing=0.99, min_delta=1e-4, save_dir=None):
         self.total_timesteps = total_timesteps
         self.num_clusters = num_clusters
         self.max_patience = max_patience
         # Smoothing factor to stabilize batch loss for the pacing function
         self.smoothing = smoothing
+        self.min_delta = min_delta
+
+        self.save_dir = save_dir
+        if self.save_dir:
+            self.csv_path = Path(self.save_dir) / 'curriculum_log.csv'
+            # Create file and write headers
+            with open(self.csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['global_step', 'stage'])
 
         # Curriculum state
         self.current_stage = 1 # Starts at stage 1 (easiest)
@@ -81,7 +93,7 @@ class CurriculumPacer:
         cutoff = self.total_timesteps - (self.current_stage * self.cluster_size)
         return max(0, int(cutoff))
 
-    def update(self, batch_loss):
+    def update(self, batch_loss, global_step):
         """
         Updates the pacer based on Algorithm 1: Pacing Function.
         """
@@ -94,7 +106,7 @@ class CurriculumPacer:
         current_loss = self.running_loss
 
         # Check convergence criteria
-        if current_loss < self.best_loss:
+        if current_loss < (self.best_loss - self.min_delta):
             self.best_loss = current_loss
             self.patience_counter = 0
         else:
@@ -105,6 +117,10 @@ class CurriculumPacer:
             if self.current_stage < self.num_clusters:
                 self.current_stage += 1
                 print(f"\n[Curriculum] Converged. Advancing to Stage {self.current_stage}/{self.num_clusters}")
+                if self.save_dir and global_step is not None:
+                    with open(self.csv_path, 'a', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([global_step, self.current_stage])
 
                 # Reset patience and best loss for the new stage (Algorithm 2)
                 self.patience_counter = 0
@@ -112,6 +128,43 @@ class CurriculumPacer:
                 # Optional: Reset running loss to adapt quickly to new task difficulty
                 self.running_loss = None 
 
+
+@torch.compiler.disable
+def measure_aeos_step(model, opt, analyzer, global_step, lr, monitor_timesteps, schedule, device, x, t, current_avg_loss):
+    """
+    Helper function to run the AEoS measurement in strict eager mode.
+    """
+    measure_bs = 32
+
+    # We still need the math backend for higher-order derivatives
+    with sdpa_kernel([SDPBackend.MATH]):
+        for ts_req in monitor_timesteps:
+            torch.cuda.empty_cache()
+
+            # 1. Prepare Data
+            if ts_req == 'random':
+                t_measure = t[:measure_bs]
+                x_measure = x[:measure_bs]
+                ts_label = "random"
+            else:
+                t_measure = torch.full((measure_bs,), ts_req, device=device).long()
+                x_measure = x[:measure_bs]
+                ts_label = f"t={ts_req}"
+
+            # 2. Forward Pass (Eager Mode)
+            loss_measure = p_losses(model, schedule, x_measure, t_measure)
+
+            # 3. Analyze
+            bs, lmax = analyzer.log_step(
+                model, opt, loss_measure, global_step, lr,
+                timestep_label=ts_label, average_loss=current_avg_loss
+            )
+
+            print(f"  [{ts_label}] Batch Sharpness: {bs:.4f} | Lambda Max (P^-1 H): {lmax:.4f}")
+            del loss_measure
+
+    print(f"  Stability Threshold (38/Eta): {38.0/lr:.4f}")
+    torch.cuda.empty_cache()
 
 
 def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_dir='./runs'):
@@ -128,15 +181,20 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
         save_dir: Directory to save checkpoints and samples
     """
     model = model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     if hasattr(torch, 'compile'):
         print("Compiling model...")
-        model = torch.compile(model, mode="reduce-overhead")
+        compiled_model = torch.compile(model)
+    else:
+        compiled_model = model
 
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler('cuda')
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    analyzer = AEoSAnalyzer(save_dir)
+    monitor_timesteps = ['random', 1, 100, 200, 300, 400, 500, 600, 700, 800, 999]
 
     # Curriculum Initialization
     # "We divided whole timesteps [0, T] into 20 uniformly divided intervals" 
@@ -144,12 +202,14 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
     pacer = CurriculumPacer(
         total_timesteps=schedule.timesteps,
         num_clusters=20,   # N=20
-        max_patience=200   # tau=200
+        max_patience=1000,   # tau=1000
+        save_dir=save_dir
     )
 
     global_step = 0
+    interval_loss = 0.0
     for epoch in range(epochs):
-        model.train()
+        compiled_model.train()
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}')
         running_loss = 0.0
         for i, (x, _) in enumerate(pbar):
@@ -160,15 +220,28 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
             # Determine the lower bound for t based on current stage
             min_t = pacer.get_min_timestep()
             # Sample t from [min_t, timesteps)
-            # "Sampled from the clusters U ... C_j" 
+            # "Sampled from the clusters U ... C_j"
             t = torch.randint(min_t, schedule.timesteps, (b,), device=device).long()
 
             opt.zero_grad()
 
+            # --- AEoS Measurement Check ---
+            if global_step > 0 and global_step % 500 == 0:
+                print(f"\n[Step {global_step}] Measuring AEoS...")
+
+                current_avg_loss = interval_loss / 500
+                interval_loss = 0.0 # reset every 500 intervals
+
+                measure_aeos_step(
+                     model, opt, analyzer, global_step, lr,
+                     monitor_timesteps, schedule, device, x, t,
+                    current_avg_loss
+                )
+
             # Runs the forward pass in FP16 (half precision) where safe, 
             # but keeps critical ops (like softmax or reductions) in FP32.
             with torch.amp.autocast('cuda'):
-                loss = p_losses(model, schedule, x, t)
+                loss = p_losses(compiled_model, schedule, x, t)
 
             # Scales loss to prevent underflow in FP16 gradients
             scaler.scale(loss).backward()
@@ -177,9 +250,10 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
 
             # Curriculum Update
             # Update the pacer with current loss to check for convergence
-            pacer.update(loss.item())
+            pacer.update(loss.item(), global_step)
 
             running_loss += loss.item()
+            interval_loss += loss.item()
             global_step += 1
 
             if global_step % 100 == 0:
@@ -197,10 +271,11 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
             'curriculum_stage': pacer.current_stage, # Save curriculum state
             'avg_epoch_loss': avg_loss
         }
-        torch.save(ckpt, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
+        # torch.save(ckpt, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
+        torch.save(ckpt, save_dir / f'latest.pt')
 
-        model.eval()
-        samples = sample_loop(model, schedule, (16,3,32,32), device=device, steps=100)
+        compiled_model.eval()
+        samples = sample_loop(compiled_model, schedule, (16,model.in_ch,32,32), device=device, steps=100)
 
         grid = (samples.clamp(-1,1) + 1) / 2.0  # to [0,1]
         utils.save_image(grid.cpu(), save_dir / f'samples_epoch_{epoch+1}.png', nrow=4)
