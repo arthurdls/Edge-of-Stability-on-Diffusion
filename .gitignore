@@ -19,3 +19,4 @@ implementations/__pycache__/
 implementations/utils/__pycache__/
 *.pt
 samples_epoch_*.png
+eos_venv/
