@@ -15,7 +15,7 @@ class AEoSAnalyzer:
         if not self.filepath.exists():
             with open(self.filepath, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['step', 'timestep', 'batch_sharpness', 'lambda_max', 'lr', 'stability_threshold_38_over_eta', 'average_loss'])
+                writer.writerow(['step', 'timestep', 'lambda_max', 'lr', 'stability_threshold_38_over_eta', 'average_loss'])
 
     def get_adam_preconditioner(self, model, optimizer, step):
         """
@@ -53,38 +53,12 @@ class AEoSAnalyzer:
         P_vec = torch.cat(vals)
         return DiagonalPreconditioner(P_vec)
 
-    def compute_batch_sharpness(self, loss, model):
-        """
-        Calculates (g^T * H * g) / ||g||^2
-        """
-        params = list(model.parameters())
-        # 1. Get Gradient
-        grads = torch.autograd.grad(loss, params, create_graph=True)
-        grad_flat = torch.cat([g.reshape(-1) for g in grads])
-        grad_norm_sq = torch.dot(grad_flat, grad_flat)
-
-        # 2. HVP of Gradient: H*g
-        grad_dot_grad = torch.dot(grad_flat, grad_flat)
-        hvp_grads = torch.autograd.grad(grad_dot_grad, params, retain_graph=True)
-        hvp_flat = torch.cat([g.reshape(-1) for g in hvp_grads])
-
-        # 3. Rayleigh Quotient
-        numerator = torch.dot(grad_flat, hvp_flat)
-        sharpness = numerator / (grad_norm_sq + 1e-8)
-        return sharpness.item() / 2.0 # divides by 2 because grad g.T g = 2 H g
-
     def log_step(self, model, optimizer, loss, step, lr, timestep_label="random", average_loss=None):
         """
-        Computes Batch Sharpness and Preconditioned Lambda Max.
+        Computes Preconditioned Lambda Max.
         """
-        # 1. Batch Sharpness (Raw Geometry)
-        try:
-            bs = self.compute_batch_sharpness(loss, model)
-        except Exception as e:
-            print(f"Warning: Batch Sharpness failed: {e}")
-            bs = 0.0
 
-        # 2. Preconditioned Lambda Max (Adam Stability)
+        # 1. Preconditioned Lambda Max (Adam Stability)
         # We extract P from the optimizer to compute eig(P^{-1} H)
         try:
             # Only construct preconditioner if step > 0 (Adam state exists)
@@ -99,11 +73,11 @@ class AEoSAnalyzer:
             print(f"Warning: Lambda Max failed: {e}")
             lmax = 0.0
 
-        # 3. Write to CSV
+        # 2. Write to CSV
         threshold = 38.0 / lr if lr > 0 else 0
         with open(self.filepath, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([step, timestep_label, bs, lmax, lr, threshold, average_loss])
+            writer.writerow([step, timestep_label, lmax, lr, threshold, average_loss])
 
-        return bs, lmax
+        return lmax
 

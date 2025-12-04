@@ -130,11 +130,10 @@ class CurriculumPacer:
 
 
 @torch.compiler.disable
-def measure_aeos_step(model, opt, analyzer, global_step, lr, monitor_timesteps, schedule, device, x, t, current_avg_loss):
+def measure_aeos_step(model, opt, analyzer, global_step, lr, monitor_timesteps, schedule, device, x, t, current_avg_loss, measure_bs):
     """
     Helper function to run the AEoS measurement in strict eager mode.
     """
-    measure_bs = 32
 
     # We still need the math backend for higher-order derivatives
     with sdpa_kernel([SDPBackend.MATH]):
@@ -155,19 +154,19 @@ def measure_aeos_step(model, opt, analyzer, global_step, lr, monitor_timesteps, 
             loss_measure = p_losses(model, schedule, x_measure, t_measure)
 
             # 3. Analyze
-            bs, lmax = analyzer.log_step(
+            lmax = analyzer.log_step(
                 model, opt, loss_measure, global_step, lr,
                 timestep_label=ts_label, average_loss=current_avg_loss
             )
 
-            print(f"  [{ts_label}] Batch Sharpness: {bs:.4f} | Lambda Max (P^-1 H): {lmax:.4f}")
+            print(f"  [{ts_label}] Lambda Max (P^-1 H): {lmax:.4f}")
             del loss_measure
 
     print(f"  Stability Threshold (38/Eta): {38.0/lr:.4f}")
     torch.cuda.empty_cache()
 
 
-def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_dir='./runs'):
+def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_dir='./runs', measure_bs=16, checkpoint=None):
     """
     Training loop for diffusion model.
 
@@ -206,9 +205,37 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
         save_dir=save_dir
     )
 
+    # Initialize starting epoch
+    start_epoch = 0
+
+    # --- Checkpoint Loading ---
+    if checkpoint is not None:
+        print(f"Loading checkpoint from {checkpoint}...")
+        ckpt_data = torch.load(checkpoint, map_location=device, weights_only=True)
+        
+        # Load model weights
+        model.load_state_dict(ckpt_data['model_state'])
+        
+        # Load optimizer and scaler state
+        opt.load_state_dict(ckpt_data['optimizer_state'])
+        scaler.load_state_dict(ckpt_data['scaler_state'])
+        
+        # Restore epoch
+        start_epoch = ckpt_data['epoch']
+        
+        # --- Restore Curriculum State ---
+        pacer.current_stage = ckpt_data['curriculum_stage']
+        print(f"Resumed Curriculum at Stage {pacer.current_stage}/{pacer.num_clusters}")
+            
+        # Recalculate the active timestep range for clarity
+        current_min_t = pacer.get_min_timestep()
+        print(f"Current training range: t ∈ [{current_min_t}, {schedule.timesteps}]")
+        
+        print(f"Resumed from epoch {start_epoch} (Prev Loss: {ckpt_data.get('avg_epoch_loss', 'N/A'):.4f})")
+
     global_step = 0
     interval_loss = 0.0
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         compiled_model.train()
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}')
         running_loss = 0.0
@@ -226,16 +253,16 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
             opt.zero_grad()
 
             # --- AEoS Measurement Check ---
-            if global_step > 0 and global_step % 500 == 0:
+            if global_step > 0 and global_step % 1 == 0:
                 print(f"\n[Step {global_step}] Measuring AEoS...")
 
-                current_avg_loss = interval_loss / 500
-                interval_loss = 0.0 # reset every 500 intervals
+                current_avg_loss = interval_loss / 1
+                interval_loss = 0.0 # reset every 1 interval
 
                 measure_aeos_step(
-                     model, opt, analyzer, global_step, lr,
-                     monitor_timesteps, schedule, device, x, t,
-                    current_avg_loss
+                    model, opt, analyzer, global_step, lr,
+                    monitor_timesteps, schedule, device, x, t,
+                    current_avg_loss, measure_bs
                 )
 
             # Runs the forward pass in FP16 (half precision) where safe, 
