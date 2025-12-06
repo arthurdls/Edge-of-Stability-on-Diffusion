@@ -76,13 +76,23 @@ class EDMPrecond(nn.Module):
         return torch.as_tensor(sigma)
 
 
-def edm_loss(model, x_start, P_mean=-1.2, P_std=1.2, sigma_data=0.5):
+def edm_loss(model, x_start, P_mean=-1.2, P_std=1.2, sigma_data=0.5, override_sigma=None):
     """
     Loss function.
     """
-    # 1. Sample sigma from Log-Normal distribution
-    rnd_normal = torch.randn([x_start.shape[0], 1, 1, 1], device=x_start.device)
-    sigma = (rnd_normal * P_std + P_mean).exp()
+    # 1. Determine Sigma
+    if override_sigma is not None:
+        # Handle manual sigma
+        if isinstance(override_sigma, (float, int)):
+            # If scalar, expand to batch size [B, 1, 1, 1]
+            sigma = torch.full((x_start.shape[0], 1, 1, 1), override_sigma, device=x_start.device)
+        else:
+            # If tensor, ensure shape is correct [B, 1, 1, 1]
+            sigma = override_sigma.to(x_start.device).view(x_start.shape[0], 1, 1, 1)
+    else:
+        # Sample sigma from Log-Normal distribution
+        rnd_normal = torch.randn([x_start.shape[0], 1, 1, 1], device=x_start.device)
+        sigma = (rnd_normal * P_std + P_mean).exp()
 
     # 2. Calculate loss weight lambda(sigma)
     weight = (sigma**2 + sigma_data**2) / (sigma * sigma_data)**2
@@ -143,9 +153,13 @@ def measure_aeos_step(model, opt, analyzer, global_step, lr, monitor_timesteps, 
             # 1. Prepare Data
             x_measure = x[:measure_bs]
             ts_label = f"σ={ts_req}"
+            if ts_req == "random":
+                sigma_measure = None
+            else:
+                sigma_measure = ts_req
 
             # 2. Forward Pass (Eager Mode)
-            loss_measure = edm_loss(model, x_measure) # No 'schedule' or 't' needed anymore
+            loss_measure = edm_loss(model, x_measure, override_sigma=sigma_measure)
 
             # 3. Analyze
             lmax = analyzer.log_step(
@@ -186,7 +200,7 @@ def edm_train_ddim(model, train_loader, device, epochs=100, lr=2e-4, save_dir='.
     save_dir.mkdir(parents=True, exist_ok=True)
 
     analyzer = AEoSAnalyzer(save_dir)
-    monitor_timesteps = torch.linspace(0.003, 79, 10)
+    monitor_timesteps = ['random', 0.002, 0.01, 0.05, 0.15, 0.5, 1.2, 5.0, 20.0, 50.0, 80.0] # log distribution
 
     # Initialize starting epoch
     start_epoch = 0
