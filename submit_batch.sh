@@ -1,6 +1,6 @@
 #!/bin/bash
 
-for lr in 1e-3 5e-4 1e-4 5e-5 1e-5
+for lr in 1e-3 5e-4 1e-4 5e-5
 do
     echo "Submitting job: LR=$lr, Base"
     sbatch -J train_base_$lr job.sh $lr --base
