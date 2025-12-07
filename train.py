@@ -90,12 +90,13 @@ else:
         float(args.lr): f'_lr_{args.lr}',
     }
 
-CHECKPOINT_ROOT = "round1"
+CHECKPOINT_ROOT = "round2"
 CHECKPOINT_FOLDER = []
-for item in os.listdir(CHECKPOINT_ROOT):
-    item_path = os.path.join(CHECKPOINT_ROOT, item)
-    if os.path.isdir(item_path):
-        CHECKPOINT_FOLDER.append(item_path)
+if os.path.isdir(CHECKPOINT_ROOT):
+    for item in os.listdir(CHECKPOINT_ROOT):
+        item_path = os.path.join(CHECKPOINT_ROOT, item)
+        if os.path.isdir(item_path):
+            CHECKPOINT_FOLDER.append(item_path)
 
 def lookup_checkpoint(save_dir_name):
     for folder in CHECKPOINT_FOLDER:
