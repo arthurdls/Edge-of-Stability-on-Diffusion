@@ -196,12 +196,12 @@ def progressive_train_ddim(model, schedule, train_loader, device, epochs=100, lr
     monitor_timesteps = ['random', 1, 100, 200, 300, 400, 500, 600, 700, 800, 999]
 
     # Curriculum Initialization
-    # "We divided whole timesteps [0, T] into 20 uniformly divided intervals" 
+    # "We divided whole timesteps [0, T] into 10 uniformly divided intervals" 
     # "Maximum patience tau ... is a fixed hyper-parameter"
     pacer = CurriculumPacer(
         total_timesteps=schedule.timesteps,
-        num_clusters=20,   # N=20
-        max_patience=1000,   # tau=1000
+        num_clusters=20,   # N=10
+        max_patience=2,   # tau=2
         save_dir=save_dir
     )
 
