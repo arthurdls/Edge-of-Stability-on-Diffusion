@@ -14,8 +14,8 @@ do
     echo "Submitting job: LR=$lr, MIN-SNR"
     sbatch -J train_snr_$lr job.sh $lr --snr
 
-    # echo "Submitting job: LR=$lr, Progressive Difficulty"
-    # sbatch -J train_pd_$lr job.sh $lr --pd
+    echo "Submitting job: LR=$lr, Progressive Difficulty"
+    sbatch -J train_pd_$lr job.sh $lr --pd
 
     echo "Submitting job: LR=$lr, Adaptive Sampling"
     sbatch -J train_adap_s_$lr job.sh $lr --adap_s
