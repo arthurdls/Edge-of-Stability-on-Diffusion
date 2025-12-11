@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # Note, for active submissions: srun -p mit_normal_gpu --gres=gpu:1 -t 00:30:00 --pty /bin/bash
+# Note this is made to run in the root folder of this project
 
 #SBATCH -p mit_normal_gpu   
 #SBATCH --gres=gpu:1 
