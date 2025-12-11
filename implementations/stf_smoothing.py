@@ -1,0 +1,248 @@
+"""
+Implementation 6
+
+Implementation: Stable Target Field (STF) for Reduced Variance
+Reference: Xu et al., 2023
+
+Summary of Changes from Standard Training:
+
+1.  Stable Target Field (STF) Objective:
+    To address the high variance of training targets in the "intermediate regime" of diffusion, this implementation replaces the standard Denoising Score Matching (DSM) objective with STF. This approach explicitly trades a small, asymptotically vanishing bias for significantly reduced variance in the gradient estimates, leading to improved stability and image quality.
+
+2.  Weighted Targets via Batch-Reference Importance Sampling:
+    Instead of regressing towards a single ground-truth noise instance, the model regresses towards a weighted average of the noise derived from the entire mini-batch.
+    We implement this using self-normalized importance sampling, where importance weights are computed dynamically via pairwise Euclidean distances between noisy and clean samples, scaled by the noise variance $sigma_t^2$.
+
+https://arxiv.org/abs/2302.00670
+"""
+
+from pathlib import Path
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import utils
+torch.backends.cudnn.benchmark = True
+
+from implementations.base_implementation import (
+    UNet, DiffusionSchedule, sample_loop)
+
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from implementations.utils.AEoSAnalyzer import AEoSAnalyzer
+
+def stf_loss(model, schedule, x_start, t):
+    """
+    Implements Stable Target Field (STF) loss.
+    Calculates a weighted target based on the entire batch acting as the reference.
+    """
+    # 1. Sample noise and perturb image (Same as standard DSM)
+    noise = torch.randn_like(x_start)
+    x_noisy = schedule.q_sample(x_start=x_start, t=t, noise=noise)
+    
+    # 2. Prepare for Pairwise Distance Calculation
+    # We need to calculate weights w_ij proportional to p(x_noisy_i | x_start_j)
+    # This requires flattening the images to vectors
+    B = x_start.shape[0]
+    flat_noisy = x_noisy.view(B, -1)
+    flat_start = x_start.view(B, -1)
+    
+    # 3. Get schedule parameters for the specific timesteps t
+    # Reshape for broadcasting: [B, 1]
+    alpha_bar = schedule.alphas_cumprod[t].view(-1, 1)
+    sqrt_alpha_bar = schedule.sqrt_alphas_cumprod[t].view(-1, 1)
+    one_minus_alpha_bar = (1. - schedule.alphas_cumprod[t]).view(-1, 1) # This is sigma^2
+    
+    # 4. Calculate Squared Euclidean Distance Matrix
+    # dist_sq[i, j] = ||x_noisy[i] - sqrt(alpha_bar[i]) * x_start[j]||^2
+    # Expansion: ||A - B||^2 = ||A||^2 + ||B||^2 - 2<A, B>
+    
+    # Force float32 for distance calculation to prevent overflow/underflow in AMP
+    with torch.cuda.amp.autocast(enabled=False):
+        flat_noisy_f32 = flat_noisy.float()
+        flat_start_f32 = flat_start.float()
+        
+        norm_noisy_sq = (flat_noisy_f32**2).sum(dim=1, keepdim=True)  # [B, 1]
+        norm_start_sq = (flat_start_f32**2).sum(dim=1).unsqueeze(0)   # [1, B]
+        dot_prod = torch.mm(flat_noisy_f32, flat_start_f32.t())       # [B, B]
+        
+        # Note: We project x_start[j] by sqrt_alpha_bar[i] because we are checking 
+        # likelihood of x_noisy[i] coming from x_start[j] at step t[i]
+        dist_sq = norm_noisy_sq + (alpha_bar * norm_start_sq) - (2 * sqrt_alpha_bar * dot_prod)
+        
+        # 5. Calculate Importance Weights (Softmax)
+        # logits = -dist_sq / (2 * sigma^2)
+        # Add epsilon to sigma^2 to prevent division by zero at t=0
+        logits = -dist_sq / (2 * one_minus_alpha_bar + 1e-5)
+        weights = F.softmax(logits, dim=1) # [B, B] sum over columns (j) = 1
+
+    # 6. Construct the Stable Target
+    # The target noise for x_i coming from x_j is: (x_noisy_i - sqrt(alpha_i)*x_start_j) / sigma_i
+    # The STF target is the weighted average of these noises.
+    # STF_Target_i = (x_noisy_i - sqrt(alpha_i) * Weighted_Average_X_Start) / sigma_i
+    
+    # Compute weighted average of clean images: sum_j (w_ij * x_start_j)
+    weights = weights.to(x_start.dtype) # Cast back to FP16 if needed
+    weighted_x_start = torch.mm(weights, flat_start).view_as(x_start)
+    
+    # Calculate the STF noise target
+    # Reshape scalars for image broadcasting [B, 1, 1, 1]
+    sqrt_alpha_view = sqrt_alpha_bar.view(-1, 1, 1, 1)
+    sigma_view = schedule.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
+    
+    target_noise = (x_noisy - sqrt_alpha_view * weighted_x_start) / sigma_view
+
+    # 7. Prediction and Loss
+    predicted_noise = model(x_noisy, t)
+    
+    # Use MSE between predicted noise and the STF target
+    return F.mse_loss(predicted_noise, target_noise)
+
+
+@torch.compiler.disable
+def measure_aeos_step(model, opt, analyzer, global_step, lr, monitor_timesteps, schedule, device, x, t, current_avg_loss, measure_bs):
+    """
+    Helper function to run the AEoS measurement in strict eager mode.
+    """
+
+    # We still need the math backend for higher-order derivatives
+    with sdpa_kernel([SDPBackend.MATH]):
+        for ts_req in monitor_timesteps:
+            torch.cuda.empty_cache()
+
+            # 1. Prepare Data
+            if ts_req == 'random':
+                t_measure = t[:measure_bs]
+                x_measure = x[:measure_bs]
+                ts_label = "random"
+            else:
+                t_measure = torch.full((measure_bs,), ts_req, device=device).long()
+                x_measure = x[:measure_bs]
+                ts_label = f"t={ts_req}"
+
+            # 2. Forward Pass (Eager Mode)
+            loss_measure = stf_loss(model, schedule, x_measure, t_measure)
+
+            # 3. Analyze
+            lmax = analyzer.log_step(
+                model, opt, loss_measure, global_step, lr,
+                timestep_label=ts_label, average_loss=current_avg_loss
+            )
+
+            print(f"  [{ts_label}] Lambda Max (P^-1 H): {lmax:.4f}")
+            del loss_measure
+
+    print(f"  Stability Threshold (38/Eta): {38.0/lr:.4f}")
+    torch.cuda.empty_cache()
+
+
+def stf_train_ddim(model, schedule, train_loader, device, epochs=100, lr=2e-4, save_dir='./runs', measure_bs=16, checkpoint=None):
+    """
+    Training loop for diffusion model.
+
+    Args:
+        model: The diffusion model (e.g., TinyUNet)
+        schedule: DiffusionSchedule instance
+        train_loader: DataLoader for training data
+        device: torch.device
+        epochs: Number of training epochs
+        lr: Learning rate
+        save_dir: Directory to save checkpoints and samples
+    """
+    model = model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    if hasattr(torch, 'compile'):
+        print("Compiling model...")
+        compiled_model = torch.compile(model)
+    else:
+        compiled_model = model
+
+    scaler = torch.amp.GradScaler('cuda')
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    analyzer = AEoSAnalyzer(save_dir)
+    monitor_timesteps = ['random', 1, 100, 200, 300, 400, 500, 600, 700, 800, 999]
+
+    # Initialize starting epoch
+    start_epoch = 0
+
+    # --- Checkpoint Loading ---
+    if checkpoint is not None:
+        print(f"Loading checkpoint from {checkpoint}...")
+        ckpt_data = torch.load(checkpoint, map_location=device, weights_only=True)
+        
+        # Load model weights
+        model.load_state_dict(ckpt_data['model_state'])
+        
+        # Load optimizer and scaler state
+        opt.load_state_dict(ckpt_data['optimizer_state'])
+        scaler.load_state_dict(ckpt_data['scaler_state'])
+        
+        # Restore epoch
+        start_epoch = ckpt_data['epoch']
+        print(f"Resumed from epoch {start_epoch} (Prev Loss: {ckpt_data.get('avg_epoch_loss', 'N/A'):.4f})")
+
+    global_step = 0
+    interval_loss = 0.0
+    for epoch in range(start_epoch, epochs):
+        compiled_model.train()
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}')
+        running_loss = 0.0
+        for i, (x, _) in enumerate(pbar):
+            x = x.to(device)
+            b = x.shape[0]
+            t = torch.randint(0, schedule.timesteps, (b,), device=device).long()
+
+            opt.zero_grad()
+
+            # --- AEoS Measurement Check ---
+            if global_step > 0 and global_step % 1 == 0:
+                print(f"\n[Step {global_step}] Measuring AEoS...")
+
+                current_avg_loss = interval_loss / 1
+                interval_loss = 0.0 # reset every 1 interval
+
+                measure_aeos_step(
+                    model, opt, analyzer, global_step, lr,
+                    monitor_timesteps, schedule, device, x, t,
+                    current_avg_loss, measure_bs
+                )
+
+            # Runs the forward pass in FP16 (half precision) where safe, 
+            # but keeps critical ops (like softmax or reductions) in FP32.
+            with torch.amp.autocast('cuda'):
+                loss = stf_loss(compiled_model, schedule, x, t)
+
+            # Scales loss to prevent underflow in FP16 gradients
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+
+            running_loss += loss.item()
+            interval_loss += loss.item()
+            global_step += 1
+
+            if global_step % 100 == 0:
+                pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{lr}'})
+
+        avg_loss = running_loss / len(train_loader)
+        print(f'End epoch {epoch+1}, avg loss {avg_loss:.4f}')
+
+        # save checkpoint
+        ckpt = {
+            'model_state': model.state_dict(),
+            'optimizer_state': opt.state_dict(),
+            'scaler_state': scaler.state_dict(),
+            'epoch': epoch+1,
+            'avg_epoch_loss': avg_loss
+        }
+        # torch.save(ckpt, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
+        torch.save(ckpt, save_dir / f'latest.pt')
+
+        compiled_model.eval()
+        samples = sample_loop(compiled_model, schedule, (16,model.in_ch,32,32), device=device, steps=100)
+
+        grid = (samples.clamp(-1,1) + 1) / 2.0  # to [0,1]
+        utils.save_image(grid.cpu(), save_dir / f'samples_epoch_{epoch+1}.png', nrow=4)
+        print('Saved samples to', save_dir / f'samples_epoch_{epoch+1}.png')
